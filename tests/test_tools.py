@@ -41,10 +41,12 @@ async def test_tool_names(mcp_client):
     assert set(await tools(mcp_client)) == {
         "get_status",
         "get_now_playing",
+        "get_remotes",
         "list_apps",
         "send_key",
         "launch_app",
         "set_power",
+        "reboot_shield",
     }
 
 
@@ -58,7 +60,8 @@ async def test_every_tool_has_title_description_and_annotations(mcp_client):
         assert a is not None, t.name
         assert a.read_only_hint is not None and a.open_world_hint is False, t.name
         if not a.read_only_hint:
-            assert a.destructive_hint is False and a.idempotent_hint is not None, t.name
+            # Only a reboot is disruptive enough for clients to confirm first.
+            assert a.destructive_hint is (t.name == "reboot_shield") and a.idempotent_hint is not None, t.name
 
 
 async def test_annotations_match_behavior(mcp_client):
@@ -66,6 +69,8 @@ async def test_annotations_match_behavior(mcp_client):
     assert t["get_status"].annotations.read_only_hint is True
     assert t["list_apps"].annotations.read_only_hint is True
     assert t["get_now_playing"].annotations.read_only_hint is True
+    assert t["get_remotes"].annotations.read_only_hint is True
+    assert t["reboot_shield"].annotations.destructive_hint is True  # interrupts playback
     assert t["send_key"].annotations.idempotent_hint is False  # DPAD_DOWN twice moves twice
     assert t["launch_app"].annotations.idempotent_hint is True
     assert t["set_power"].annotations.idempotent_hint is True  # WAKEUP/SLEEP, not a toggle
@@ -83,10 +88,14 @@ async def test_set_power_schema(mcp_client):
     assert set(props["state"]["enum"]) == {"on", "off"}
 
 
-async def test_get_now_playing_takes_no_arguments(mcp_client):
-    # It runs a shell command over ADB, so nothing the model writes may reach it.
+@pytest.mark.parametrize("name", ["get_now_playing", "get_remotes", "reboot_shield"])
+async def test_adb_tools_take_no_arguments(mcp_client, name):
+    # They run commands over ADB, so nothing the model writes may reach them.
+    assert not (await tools(mcp_client))[name].input_schema.get("properties")
+
+
+async def test_get_now_playing_output_schema(mcp_client):
     t = (await tools(mcp_client))["get_now_playing"]
-    assert not t.input_schema.get("properties")
     assert set(t.output_schema["required"]) == {"state", "app_package", "app", "title", "subtitle", "position_s"}
 
 

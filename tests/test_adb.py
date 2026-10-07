@@ -1,5 +1,5 @@
-"""ADB now-playing: parsing real `dumpsys media_session` output, and the guard
-that only the one fixed command ever reaches the Shield."""
+"""ADB: parsing real `dumpsys` output (media sessions, Bluetooth remotes), the
+reboot flow, and the guard that only fixed commands ever reach the Shield."""
 
 from __future__ import annotations
 
@@ -9,7 +9,18 @@ import pytest
 from adb_shell.exceptions import DeviceAuthError, TcpTimeoutException
 
 from shieldtv_mcp import adb
-from shieldtv_mcp.adb import NOW_PLAYING_COMMAND, now_playing, parse_sessions, read_now_playing
+from shieldtv_mcp.adb import (
+    BOOT_COMMAND,
+    NOW_PLAYING_COMMAND,
+    REMOTES_COMMAND,
+    now_playing,
+    parse_remotes,
+    parse_sessions,
+    read_now_playing,
+    read_remotes,
+    reboot_and_check,
+    run_command,
+)
 from shieldtv_mcp.client import ShieldError
 
 pytestmark = pytest.mark.anyio
@@ -120,16 +131,103 @@ def test_missing_uptime_reports_the_snapshot():
     assert now_playing(dump(YOUTUBE_PLAYING, uptime=""), names)["position_s"] == 1.4
 
 
+# --- Bluetooth remotes ------------------------------------------------------------
+# Built from a real Shield's dumps (2026-10). Four paired devices: an older
+# Shield remote (allowed as input, not connected since boot), earbuds (not an
+# input device), a Shield remote, and the Harmony hub ("Harmony Keyboard").
+HARMONY, NVIDIA = "00:04:20:FB:44:6B", "48:B0:2D:6B:7D:C5"
+BONDED = """\
+AdapterProperties
+  Bonded devices:
+    00:04:4B:F2:89:3A [  LE  ] NVIDIA SHIELD Remote
+    74:5C:4B:C4:FC:32 [BR/EDR] Jabra Elite Active 65t
+    48:B0:2D:6B:7D:C5 [  LE  ] NVIDIA SHIELD Remote
+    00:04:20:FB:44:6B [BR/EDR] Harmony Keyboard
+mSnoopLogSettingAtEnable = empty
+"""
+METADATA = """\
+BluetoothDatabase:
+  Metadata Changes:
+
+Metadata:
+    00:04:20:FB:44:6B {profile connection policy(A2DP=-1|HEADSET=-1|HID_HOST=100|PAN=-1), optional codec(support=-1)}
+    48:B0:2D:6B:7D:C5 {profile connection policy(A2DP=-1|HEADSET=-1|HID_HOST=100|PAN=-1), optional codec(support=-1)}
+    74:5C:4B:C4:FC:32 {profile connection policy(A2DP=100|HEADSET=-1|HID_HOST=-1|PAN=-1), optional codec(support=-1)}
+    00:04:4B:F2:89:3A {profile connection policy(A2DP=-1|HEADSET=-1|HID_HOST=100|PAN=-1), optional codec(support=-1)}
+"""
+INPUT_DEVICE = """\
+    {n}: {name}
+      Path: /dev/input/event{n}
+      UniqueId: {address}
+      Identifier: bus=0x0005, vendor=0xffff, product=0x0000, version=0x0000
+"""
+
+
+def remotes_dump(harmony: str = "working", nvidia: str = "stuck") -> str:
+    """State per remote: "working", "stuck" (connected, no input device),
+    "disconnected", or "absent" (not connected since Bluetooth started)."""
+    hid = {"working": 2, "stuck": 2, "disconnected": 0}
+    lines, inputs = [], []
+    for n, (address, name, state) in enumerate(
+        [(HARMONY, "Harmony Keyboard", harmony), (NVIDIA, "NVIDIA SHIELD Remote", nvidia)], start=14
+    ):
+        if state in hid:
+            lines.append(f"    {address} : {hid[state]}")
+        if state == "working":
+            inputs.append(INPUT_DEVICE.format(n=n, name=name, address=address.lower()))
+    return (
+        BONDED
+        + "Profile: HidHostService\n  mTargetDevice: null\n  mInputDevices:\n"
+        + "\n".join(lines)
+        + "\n\nProfile: AvrcpTargetService:\n"
+        + METADATA
+        + "__INPUT__\nEvent Hub State:\n  Devices:\n    -1: Virtual\n      UniqueId: <virtual>\n"
+        + "      Identifier: bus=0x0000, vendor=0x0000, product=0x0000, version=0x0000\n"
+        + "".join(inputs)
+    )
+
+
+def states(text: str) -> dict[str, str]:
+    return {r["address"]: r["state"] for r in parse_remotes(text)}
+
+
+def test_parse_remotes_lists_paired_input_devices_in_order():
+    assert parse_remotes(remotes_dump()) == [
+        {"name": "NVIDIA SHIELD Remote", "address": "00:04:4B:F2:89:3A", "state": "disconnected"},
+        {"name": "NVIDIA SHIELD Remote", "address": NVIDIA, "state": "stuck"},
+        {"name": "Harmony Keyboard", "address": HARMONY, "state": "working"},
+    ]  # no earbuds: HID_HOST=-1
+
+
+def test_connected_without_input_device_is_stuck():
+    # The state seen after a real reboot: Bluetooth says connected, but Android
+    # never created the input device, so the buttons do nothing.
+    assert states(remotes_dump(harmony="stuck"))[HARMONY] == "stuck"
+
+
+@pytest.mark.parametrize("harmony", ["disconnected", "absent"])
+def test_remote_not_in_use_is_disconnected_not_stuck(harmony):
+    # "absent": just after a reboot, before the hub has reconnected. It must
+    # still be listed, not silently dropped.
+    assert states(remotes_dump(harmony=harmony))[HARMONY] == "disconnected"
+
+
 # --- talking to the Shield -------------------------------------------------------
 class FakeDevice:
-    """Stands in for adb_shell's AdbDeviceTcpAsync; records every shell command."""
+    """Stands in for adb_shell's AdbDeviceTcpAsync; records every shell command.
+
+    outputs maps command -> output (a str, or a list consumed one per call).
+    While `down` > 0, each connect fails as if the Shield were rebooting.
+    """
 
     def __init__(self, output: str = "", connect_error: Exception | None = None) -> None:
-        self.output = output
+        self.outputs: dict[str, str | list[str]] = {NOW_PLAYING_COMMAND: output}
         self.connect_error = connect_error
         self.commands: list[str] = []
         self.built_with: tuple[object, ...] = ()
         self.closed = False
+        self.rebooted = False
+        self.down = 0
 
     def build(self, host: str, port: int, **kwargs: object) -> FakeDevice:
         self.built_with = (host, port)
@@ -138,14 +236,37 @@ class FakeDevice:
     async def connect(self, rsa_keys: list[object], auth_timeout_s: float) -> bool:
         if self.connect_error:
             raise self.connect_error
+        if self.down:
+            self.down -= 1
+            raise ConnectionRefusedError("rebooting")
         return True
 
     async def shell(self, command: str, read_timeout_s: float) -> str:
         self.commands.append(command)
-        return self.output
+        out = self.outputs[command]
+        if isinstance(out, list):  # the last one repeats
+            return out.pop(0) if len(out) > 1 else out[0]
+        return out
+
+    async def reboot(self) -> None:
+        self.rebooted = True
+        raise ConnectionResetError("going down")  # as the real one may
 
     async def close(self) -> None:
         self.closed = True
+
+
+class FakeClock:
+    """time.monotonic and asyncio.sleep for the reboot loop, without waiting."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    async def sleep(self, seconds: float) -> None:
+        self.now += seconds
 
 
 @pytest.fixture
@@ -184,3 +305,77 @@ async def test_adb_failures_are_tool_errors(adb_settings, error, message):
     with pytest.raises(ShieldError, match=message):
         await read_now_playing(adb_settings, device_factory=device.build)
     assert device.commands == [] and device.closed
+
+
+async def test_only_fixed_commands_reach_a_shell(adb_settings):
+    with pytest.raises(ValueError, match="not an allowed ADB command"):
+        await run_command(adb_settings, "rm -rf /sdcard", device_factory=FakeDevice().build)
+
+
+async def test_get_remotes_reports_stuck_remote_with_advice(adb_settings):
+    device = FakeDevice()
+    device.outputs[REMOTES_COMMAND] = remotes_dump()
+    report = await read_remotes(adb_settings, device_factory=device.build)
+    assert report["advice"].startswith("NVIDIA SHIELD Remote is connected over Bluetooth but has no input device")
+    assert "Harmony hub, press Off and start the activity again" in report["advice"]
+    assert device.commands == [REMOTES_COMMAND]
+
+
+async def reboot(adb_settings, device: FakeDevice, booted_after_polls: int = 1):
+    """Run reboot_and_check on a fake clock. The Shield refuses connections
+    for two polls, then answers but is still booting for booted_after_polls."""
+    device.outputs[BOOT_COMMAND] = [""] * booted_after_polls + ["1"]
+    clock = FakeClock()
+
+    async def sleep(seconds: float) -> None:
+        await clock.sleep(seconds)
+        if clock.now == adb.POLL_S * 3:  # the grace period after the reboot command
+            device.down = 2
+
+    result = await reboot_and_check(adb_settings, device_factory=device.build, sleep=sleep, clock=clock)
+    assert device.rebooted
+    return result, clock.now - adb.POLL_S * 6  # seconds spent watching remotes after boot
+
+
+async def test_reboot_names_a_remote_that_hasnt_reconnected(adb_settings):
+    # Seen on a real Shield: the Harmony hub stayed disconnected after the
+    # reboot until a button was pressed, then worked.
+    device = FakeDevice()
+    device.outputs[REMOTES_COMMAND] = [remotes_dump(nvidia="working"), remotes_dump(harmony="absent", nvidia="working")]
+    result, watched = await reboot(adb_settings, device)
+    assert result["back_after_s"] == adb.POLL_S * 6  # grace, 2 refused, 1 still booting, booted
+    assert states_of(result) == {"00:04:4B:F2:89:3A": "disconnected", NVIDIA: "working", HARMONY: "disconnected"}
+    assert result["advice"].startswith("Harmony Keyboard worked before the reboot and hasn't reconnected yet.")
+    assert watched == adb.REMOTES_SETTLE_S  # no waiting for it: it reconnects only when used
+
+
+async def test_reboot_reports_a_remote_that_came_back_stuck(adb_settings):
+    device = FakeDevice()
+    device.outputs[REMOTES_COMMAND] = [remotes_dump(harmony="disconnected"), remotes_dump(nvidia="working")]
+    result, _ = await reboot(adb_settings, device)
+    # The Shield remote was stuck before; the reboot fixed it. The hub was off
+    # before, so its absence isn't news.
+    assert states_of(result)[NVIDIA] == "working"
+    device.outputs[REMOTES_COMMAND] = [remotes_dump(nvidia="working"), remotes_dump(harmony="stuck", nvidia="working")]
+    result, _ = await reboot(adb_settings, device)
+    assert result["advice"].startswith("Harmony Keyboard is connected over Bluetooth but has no input device")
+
+
+async def test_reboot_with_remotes_fine_has_no_advice(adb_settings):
+    device = FakeDevice()
+    device.outputs[REMOTES_COMMAND] = remotes_dump(nvidia="working")
+    result, _ = await reboot(adb_settings, device)
+    assert result["advice"] is None
+
+
+async def test_reboot_that_never_comes_back_is_an_error(adb_settings):
+    device = FakeDevice()
+    device.outputs[REMOTES_COMMAND] = remotes_dump()
+    device.outputs[BOOT_COMMAND] = "0"
+    clock = FakeClock()
+    with pytest.raises(ShieldError, match="wasn't back after 180s"):
+        await reboot_and_check(adb_settings, device_factory=device.build, sleep=clock.sleep, clock=clock)
+
+
+def states_of(result) -> dict[str, str]:
+    return {r["address"]: r["state"] for r in result["remotes"]}

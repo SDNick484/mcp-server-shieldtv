@@ -140,7 +140,7 @@ async def _cmd_pair(host_arg: str | None) -> int:
 
 
 async def _cmd_adb_setup() -> int:
-    """Enable the optional, read-only ADB features (get_now_playing).
+    """Enable the optional ADB tools (get_now_playing, get_remotes, reboot_shield).
 
     1. Generate an ADB key pair (if missing), private to this config dir.
     2. Connect with it. An untrusted key makes the Shield ask "Allow USB
@@ -148,7 +148,7 @@ async def _cmd_adb_setup() -> int:
     3. Run the one fixed command once to prove it works, then save "adb": true.
     """
     # Imported here so `pair` and `discover` don't need adb-shell loaded.
-    from .adb import ensure_adb_key, now_playing, run_now_playing_command
+    from .adb import NOW_PLAYING_COMMAND, ensure_adb_key, now_playing, run_command
     from .client import ShieldError
 
     settings = load_settings()
@@ -164,7 +164,7 @@ async def _cmd_adb_setup() -> int:
         '"Always allow from this computer" and choose Allow (waiting up to 60s).'
     )
     try:
-        text = await run_now_playing_command(dataclasses.replace(settings, adb=True), auth_timeout_s=60.0)
+        text = await run_command(dataclasses.replace(settings, adb=True), NOW_PLAYING_COMMAND, auth_timeout_s=60.0)
     except ShieldError as exc:
         print(
             f"{exc}\nNetwork debugging must be on: Settings > Device Preferences > About, select Build "
@@ -186,7 +186,7 @@ def main() -> None:
     p_pair.add_argument("--host", help="Shield IP address (skips mDNS discovery)")
     p_disc = sub.add_parser("discover", help="list Android TV devices on the LAN")
     p_disc.add_argument("--timeout", type=float, default=5.0)
-    sub.add_parser("adb-setup", help="enable the optional read-only ADB tools (get_now_playing)")
+    sub.add_parser("adb-setup", help="enable the optional ADB tools (now playing, remotes, reboot)")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     args = parser.parse_args()
 

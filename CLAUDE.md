@@ -14,7 +14,7 @@ explain the reasoning behind non-obvious changes instead of only making them.
 - `src/shieldtv_mcp/config.py`: settings, file locations, and the key and app allow-lists
 - `src/shieldtv_mcp/client.py`: `ShieldClient`, the long-lived connection plus pushed-state cache
 - `src/shieldtv_mcp/server.py`: MCP tools (`MCPServer` from `mcp` 2.x)
-- `src/shieldtv_mcp/adb.py`: optional ADB, `get_now_playing`'s one fixed command and its parser
+- `src/shieldtv_mcp/adb.py`: optional ADB: constant `COMMANDS`, their parsers, and the reboot flow
 - `src/shieldtv_mcp/cli.py`: `serve` (default), `pair`, `discover`, `adb-setup`
 - `src/shieldtv_mcp/discovery.py`: mDNS lookup for `_androidtvremote2._tcp`
 - `tests/`: `conftest.py` (`FakeRemote`, which mirrors the library's real data shapes),
@@ -26,8 +26,10 @@ explain the reasoning behind non-obvious changes instead of only making them.
 
 - **Never expose `adb shell`, arbitrary key codes, or any escape hatch to a shell.** Keys
   and apps are allow-lists; widen them deliberately and update README and tests together.
-  ADB is touched only in `adb.py`, and only with constant commands; no tool argument may
-  ever reach a shell command (`test_get_now_playing_takes_no_arguments` guards this).
+  ADB is touched only in `adb.py`, and only with the constants in `COMMANDS` (`run_command`
+  refuses anything else); no tool argument may ever reach a shell command
+  (`test_adb_tools_take_no_arguments` guards this). `reboot_shield` is the one tool with
+  `destructive_hint=True`.
 - Raise `ShieldError` (a `ToolError`) for anything the model or user can act on. Other
   exceptions reach the model only as "Error executing tool".
 - Log to **stderr only**. stdout is the MCP stdio transport.
@@ -44,7 +46,7 @@ explain the reasoning behind non-obvious changes instead of only making them.
 
 Verified on a real Shield (remote service 7.00, 2026-10): pair, `get_status`, keys,
 `launch_app`, `set_power` (`SLEEP` reports `standby` at once; any key, not just
-`WAKEUP`, wakes it), and `adb-setup` + `get_now_playing`.
+`WAKEUP`, wakes it), `adb-setup`, `get_now_playing` and `get_remotes`.
 
 Hardware facts the code depends on (the library hides them):
 - `market://launch?id=<pkg>` (what a bare package becomes) is rejected: the Shield sends
@@ -62,6 +64,15 @@ Hardware facts the code depends on (the library hides them):
   the artist (music) or channel (YouTube TV) in subtitle. YouTube TV's position is a stream
   offset (~13h). YouTube Music plays through `com.google.android.youtube.tv`. The Shield's
   ADB prompt must be answered on the TV; `adb-setup` waits 60s.
+- After a reboot, Bluetooth remotes can be HID-connected (`dumpsys bluetooth_manager`
+  mInputDevices state 2) with no input device (no `dumpsys input` entry with `bus=0x0005` and
+  `UniqueId` = their address), so buttons do nothing. Harmony fix: Off, then start the
+  activity. `svc bluetooth disable` from ADB is silently ignored on this build. After the
+  reboot command, ADB and the remote service were back in 33-38s. The Harmony hub doesn't
+  reconnect on its own after a reboot (it stayed disconnected 2+ minutes, then reconnected
+  and worked when a button was pressed), so `reboot_shield` doesn't wait for it, and
+  mInputDevices may not list it (paired input devices come from `HID_HOST=100` in the
+  Metadata section instead).
 - Volume behind HDMI-CEC arrives with `max == 0`; it is reported as `None`. In standby the
   Shield reports its own volume (e.g. 1/15) instead.
 

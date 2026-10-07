@@ -21,9 +21,10 @@ This is not an official NVIDIA project, and NVIDIA publishes no MCP server for t
 | Good for | D-pad, media keys, app launch, power/app state | Deep device inspection |
 | Risk if exposed to an LLM | Bounded: it can only press keys | High: `adb shell` is arbitrary code execution |
 
-One optional ADB feature, `get_now_playing`, reads media metadata the remote protocol
-doesn't expose. It is off until you run `adb-setup`, and it runs a single fixed, read-only
-command; the server never exposes a raw shell (see [What's playing](#whats-playing-optional-adb)).
+Three optional ADB tools do what the remote protocol can't: `get_now_playing`,
+`get_remotes` and `reboot_shield`. They are off until you run `adb-setup`, and they run
+only fixed commands; the server never exposes a raw shell (see
+[ADB tools](#adb-tools-optional)).
 
 ## Install
 
@@ -46,7 +47,7 @@ machine must be able to reach the Shield on these ports:
 | TCP 6466 | Remote control (every tool call) |
 | TCP 6467 | Pairing (only during `pair`) |
 | UDP 5353 (mDNS) | `discover`, and `pair` without `--host` |
-| TCP 5555 | ADB, only if you enable `get_now_playing` with `adb-setup` |
+| TCP 5555 | ADB, only if you enable the ADB tools with `adb-setup` |
 
 A firewall, a guest network, or a separate IoT VLAN between the two will show up as
 "can't reach the Shield".
@@ -67,10 +68,10 @@ them. To revoke access, remove the device from the Shield's settings and re-pair
 WSL2 note: mDNS discovery needs mirrored networking (`networkingMode=mirrored` in
 `%UserProfile%\.wslconfig`, then `wsl --shutdown`). Otherwise pass `--host`.
 
-### What's playing (optional, ADB)
+### ADB tools (optional)
 
-The remote protocol knows which app is in front, not what it's playing. Android's media
-sessions do, and `get_now_playing` reads them over ADB. To enable it:
+The remote protocol knows which app is in front, but not what it's playing, whether your
+Bluetooth remotes work, or how to reboot. ADB can do all three. To enable the ADB tools:
 
 1. On the Shield: Settings > Device Preferences > About, select **Build** seven times, then
    Developer options > **Network debugging** on.
@@ -82,11 +83,26 @@ files and sets `"adb": true` in `config.json`. **The ADB key grants a shell on t
 guard it more carefully than the pairing files.** To revoke it, use Developer options >
 Revoke USB debugging authorizations.
 
-What it reports, checked on a real Shield: the app, title, subtitle (the artist for music,
+**`get_now_playing`** reports, checked on a real Shield: the app, title, subtitle (the artist for music,
 the channel for live TV), play state, and position. Live TV (YouTube TV, Sling) reports no
 position, since its "position" is an offset into the stream. Music played from YouTube Music
 shows up as the YouTube app. Duration and album aren't available this way. A title that
 contains ", " can rarely split wrong (the system prints title and artist joined by ", ").
+
+**`get_remotes`** lists Bluetooth remotes (a Harmony hub shows up as "Harmony Keyboard")
+(every paired input device, even ones that haven't connected since the Shield started)
+as `working`, `disconnected` (normal when not in use), or `stuck`: Bluetooth says it is
+connected, but Android never created its input device, so its buttons do nothing. This
+happened to both remotes on a real Shield after a reboot. The fix for a Harmony hub is to
+press Off and start the activity again.
+
+**`reboot_shield`** notes which remotes work, restarts the Shield, and waits until it has
+booted (about 35 seconds on a real Shield) plus 20 seconds for remotes that reconnect on
+their own. It reports any remote that came back stuck, with the fix, and any that worked
+before but hasn't reconnected yet. A Harmony hub doesn't reconnect until a button is
+pressed, so expect it to be listed that way; if it then does nothing, `get_remotes` says
+whether it's stuck. The whole call takes about a minute. It is marked destructive, so MCP
+clients ask before running it.
 
 ## Use it with an MCP client
 
@@ -118,7 +134,7 @@ Shield; note that `pair` also saves its host as the default in `config.json`).
 |---|---|
 | `host` | The Shield's address, saved by `pair` |
 | `apps` | Extra or overriding app names for `launch_app` (see below) |
-| `adb` | `true` once `adb-setup` succeeds; enables `get_now_playing` |
+| `adb` | `true` once `adb-setup` succeeds; enables the ADB tools |
 
 When the host is set in more than one place, the most specific wins: `pair --host`, then
 `SHIELDTV_HOST`, then `config.json`.
@@ -133,8 +149,10 @@ When the host is set in more than one place, the most specific wins: `pair --hos
 | `launch_app` | Launch an allow-listed app by friendly name, and confirm it reached the foreground |
 | `set_power` | Wake (`on`) or sleep (`off`) using `WAKEUP`/`SLEEP`, not the `POWER` toggle |
 | `get_now_playing` | App, title, subtitle (artist or channel), play state and position. Needs `adb-setup` |
+| `get_remotes` | Each Bluetooth remote and whether it works, with a fix for stuck ones. Needs `adb-setup` |
+| `reboot_shield` | Restart the Shield, wait until it's back, then check the remotes. Needs `adb-setup` |
 
-`get_status` and `get_now_playing` return structured content with a published output schema.
+`get_status` and the ADB tools return structured content with a published output schema.
 
 Allowed keys: `HOME`, `BACK`, `MENU`, `DPAD_UP`/`DOWN`/`LEFT`/`RIGHT`/`CENTER`,
 `MEDIA_PLAY_PAUSE`, `MEDIA_PLAY`, `MEDIA_PAUSE`, `MEDIA_STOP`, `MEDIA_NEXT`,
@@ -195,9 +213,12 @@ app, the app usually still opens, but its own scheme (if it has one) avoids the 
   mute), raw numeric key codes, and the library's `text:` typing are not available.
 - **Apps are an allow-list.** Only names in `list_apps` can be launched.
 - **No shell and no arbitrary key codes**, so a prompt-injected model has a small blast
-  radius. ADB is off by default. When enabled, `get_now_playing` takes no arguments and runs
-  one constant command (`dumpsys media_session` plus `/proc/uptime`), so nothing the model
-  writes reaches the Shield's shell.
+  radius. ADB is off by default. When enabled, the ADB tools take no arguments and run only
+  constant commands (`dumpsys media_session`, `dumpsys bluetooth_manager`, `dumpsys input`,
+  `getprop sys.boot_completed`, `/proc/uptime`), plus ADB's own reboot service. Code that
+  tries any other command is refused, so nothing the model writes reaches the Shield's shell.
+- **`reboot_shield` is the only tool marked destructive**: it interrupts playback, so
+  clients should confirm with you first.
 - **Credentials are private** (`0600`) and never logged. Logs go to stderr because stdout
   belongs to the MCP transport.
 - Tools carry titles and MCP annotations (`readOnlyHint`, `destructiveHint`,

@@ -22,7 +22,7 @@ from mcp.server import MCPServer
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
-from .adb import NowPlaying, read_now_playing
+from .adb import NowPlaying, RebootResult, RemotesReport, read_now_playing, read_remotes, reboot_and_check
 from .client import ShieldClient, ShieldError, Status
 from .config import KeyName, load_settings
 
@@ -83,6 +83,9 @@ _ACT = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_
 _ACT_IDEMPOTENT = ToolAnnotations(
     read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=False
 )
+# The one exception to destructive_hint=False: a reboot interrupts whatever is
+# playing and can leave the Bluetooth remotes stuck, so clients should confirm.
+_DISRUPTIVE = ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_hint=False, open_world_hint=False)
 
 
 @mcp.tool(title="Get Shield status", annotations=_READ)
@@ -102,6 +105,26 @@ async def get_now_playing() -> NowPlaying:
     `mcp-server-shieldtv adb-setup`; without it this returns an error saying so.
     """
     return await read_now_playing(client().settings)
+
+
+@mcp.tool(title="Check Bluetooth remotes", annotations=_READ)
+async def get_remotes() -> RemotesReport:
+    """List the Shield's Bluetooth remotes (e.g. a Harmony hub) and whether each works.
+
+    state is "working", "stuck" (connected but its buttons do nothing; advice says how to fix it),
+    "connecting" or "disconnected" (normal for a remote not in use). Needs ADB (adb-setup).
+    """
+    return await read_remotes(client().settings)
+
+
+@mcp.tool(title="Reboot the Shield", annotations=_DISRUPTIVE)
+async def reboot_shield() -> RebootResult:
+    """Restart the Shield. Only do this when the user asks for a reboot: it stops whatever is playing.
+
+    Takes about a minute: waits until the Shield is back, then checks the Bluetooth remotes, since a
+    reboot can leave them connected but not working. If so, advice says how to fix it. Needs ADB (adb-setup).
+    """
+    return await reboot_and_check(client().settings)
 
 
 @mcp.tool(title="List launchable apps", annotations=_READ)
