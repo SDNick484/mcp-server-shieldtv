@@ -107,7 +107,7 @@ async def test_get_status(mcp_client):
 
 async def test_list_apps(mcp_client):
     apps = (await mcp_client.call_tool("list_apps", {})).structured_content
-    assert apps["netflix"] == "com.netflix.ninja"
+    assert apps["netflix"] == "https://www.netflix.com/title"
     assert apps["mine"] == "com.example.mine"
 
 
@@ -127,9 +127,17 @@ async def test_send_key_rejects_bad_args_before_the_shield(mcp_client, fake, arg
 
 
 async def test_launch_app(mcp_client, fake):
+    fake.launch_outcomes["https://www.youtube.com"] = "com.google.android.youtube.tv"
     result = await mcp_client.call_tool("launch_app", {"app": " YouTube "})
-    assert text(result) == "Launched youtube (com.google.android.youtube.tv)"
-    assert fake.launched == ["com.google.android.youtube.tv"]
+    assert text(result) == "Launched youtube (com.google.android.youtube.tv is in the foreground)"
+    assert fake.launched == ["https://www.youtube.com"]
+
+
+async def test_failed_launch_tells_the_model_what_happened(mcp_client, fake):
+    fake.launch_outcomes["https://www.youtube.com"] = "reject"
+    result = await mcp_client.call_tool("launch_app", {"app": "youtube"})
+    assert result.is_error
+    assert "rejected the launch request" in text(result)
 
 
 async def test_launch_unknown_app_lists_known_ones(mcp_client, fake):
@@ -141,8 +149,8 @@ async def test_launch_unknown_app_lists_known_ones(mcp_client, fake):
 
 
 async def test_set_power(mcp_client, fake):
-    assert text(await mcp_client.call_tool("set_power", {"state": "off"})) == "Requested power off"
-    assert text(await mcp_client.call_tool("set_power", {"state": "on"})) == "Requested power on"
+    assert text(await mcp_client.call_tool("set_power", {"state": "off"})) == "The Shield is in standby"
+    assert text(await mcp_client.call_tool("set_power", {"state": "on"})) == "The Shield is on"
     assert fake.keys == ["SLEEP", "WAKEUP"]
 
 

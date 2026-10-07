@@ -10,7 +10,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 
 from shieldtv_mcp import client as client_mod
 from shieldtv_mcp.client import ShieldClient, ShieldError
-from shieldtv_mcp.config import load_settings
+from shieldtv_mcp.config import App, load_settings
 
 from .conftest import wait_until
 
@@ -116,6 +116,13 @@ async def test_pushed_state_updates_snapshot(connected, fake):
     assert snap["volume"] == {"level": 3, "max": 15, "muted": True}
 
 
+async def test_volume_handed_to_cec_is_unknown_not_zero(connected, fake):
+    # Seen on a real Shield whose volume goes to an AV receiver over HDMI-CEC:
+    # the volume message arrives with no level or max at all.
+    fake.push("volume_info", {"level": 0, "max": 0, "muted": False})
+    assert connected.snapshot()["volume"] is None
+
+
 async def test_unreachable_while_reconnecting(connected, fake):
     fake.push("is_available", False)
     assert connected.snapshot()["reachable"] is False
@@ -143,9 +150,16 @@ def test_snapshot_before_connecting(settings):
 # --- commands ---------------------------------------------------------------
 async def test_send_key_and_power(connected, fake):
     connected.send_key("HOME")
-    connected.set_power(True)
-    connected.set_power(False)
+    await connected.set_power(True)
+    await connected.set_power(False)
     assert fake.keys == ["HOME", "WAKEUP", "SLEEP"]
+    assert connected.is_on is False
+
+
+async def test_power_change_the_shield_never_reports_is_an_error(connected, fake):
+    fake.ignore_power = True
+    with pytest.raises(ShieldError, match="didn't report the change.*still reports on"):
+        await connected.set_power(False)
 
 
 @pytest.mark.parametrize("key", ["POWER", "SEARCH", "MUTE", "KEYCODE_POWER", "26", "text:hello", "home"])
@@ -157,9 +171,49 @@ async def test_keys_outside_allow_list_never_reach_the_shield(connected, fake, k
     assert fake.keys == []
 
 
-async def test_launch(connected, fake):
-    connected.launch("com.netflix.ninja")
-    assert fake.launched == ["com.netflix.ninja"]
+NETFLIX = App("https://www.netflix.com/title", "com.netflix.ninja")
+YOUTUBE = App("https://www.youtube.com", "com.google.android.youtube.tv")
+
+
+async def test_launch_confirms_the_app_is_in_front(connected, fake):
+    fake.push("current_app", "com.google.android.tvlauncher")
+    fake.launch_outcomes[YOUTUBE.target] = YOUTUBE.package
+    assert await connected.launch(YOUTUBE) == YOUTUBE.package
+    assert fake.launched == [YOUTUBE.target]
+
+
+async def test_launch_of_the_app_already_in_front_succeeds(connected, fake):
+    # The fake starts with Netflix in front; relaunching changes nothing.
+    assert await connected.launch(NETFLIX) == "com.netflix.ninja"
+
+
+async def test_launch_without_known_package_accepts_any_new_foreground_app(connected, fake):
+    fake.launch_outcomes["https://example.com/x"] = "com.example.x"
+    assert await connected.launch(App("https://example.com/x")) == "com.example.x"
+
+
+async def test_returning_to_the_home_screen_is_not_a_launch(connected, fake):
+    # Real Shield: HOME, then a link with no app to handle it. The launcher's
+    # late "now in front" push must not be mistaken for the app opening.
+    fake.launch_outcomes["https://example.com/x"] = "com.google.android.tvlauncher"
+    with pytest.raises(ShieldError, match="foreground app didn't change"):
+        await connected.launch(App("https://example.com/x"))
+
+
+async def test_rejected_launch_is_an_error_not_a_success(connected, fake):
+    # Real Shield: market://launch?id=... gets a remote_error, then the
+    # connection drops and the library reconnects ~0.1s later.
+    fake.launch_outcomes["com.netflix.ninja"] = "reject"
+    with pytest.raises(ShieldError, match="rejected the launch request"):
+        await connected.launch(App("com.netflix.ninja", "com.netflix.ninja"))
+    assert connected.drops == 1 and connected.available
+
+
+async def test_launch_that_opens_nothing_is_an_error(connected, fake):
+    # Real Shield: an accepted link with no app to handle it shows a dialog,
+    # and the foreground app never changes.
+    with pytest.raises(ShieldError, match="foreground app didn't change.*still com.netflix.ninja"):
+        await connected.launch(YOUTUBE)
 
 
 async def test_dropped_connection_is_a_tool_error(connected, fake):

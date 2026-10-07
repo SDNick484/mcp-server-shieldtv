@@ -37,9 +37,19 @@ explain the reasoning behind non-obvious changes instead of only making them.
 
 ## Status
 
-Unit-tested only; **not yet verified on a real Shield.** The first roadmap item is a
-hardware pass: pair, `get_status`, keys, app launch, and `WAKEUP`/`SLEEP`.
-Default app package names are best guesses until checked.
+Verified on a real Shield (remote service 7.00, 2026-10): pair, `get_status`, keys,
+`launch_app`, and `set_power` (`SLEEP` reports `standby` at once; any key, not just
+`WAKEUP`, wakes it).
+
+Hardware facts the code depends on (the library hides them):
+- `market://launch?id=<pkg>` (what a bare package becomes) is rejected: the Shield sends
+  `remote_error`, which the library only logs, then drops the connection. https links work.
+- After a drop, sends on the old connection are silently discarded, so one bad command can
+  make later ones look like they succeeded. Never trust a send as proof; `launch` checks the
+  foreground app.
+- A link no installed app handles is accepted; the foreground app just doesn't change.
+- Volume behind HDMI-CEC arrives with `max == 0`; it is reported as `None`. In standby the
+  Shield reports its own volume (e.g. 1/15) instead.
 
 ## Commands
 

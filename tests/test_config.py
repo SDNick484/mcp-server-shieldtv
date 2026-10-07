@@ -12,6 +12,7 @@ from androidtvremote2.remotemessage_pb2 import RemoteKeyCode
 from shieldtv_mcp.config import (
     ALLOWED_KEYS,
     DEFAULT_APPS,
+    App,
     KeyName,
     ensure_private_dir,
     load_settings,
@@ -40,10 +41,17 @@ def test_speaker_mute_is_volume_mute():
     assert "VOLUME_MUTE" in ALLOWED_KEYS
 
 
+def test_default_apps_launch_by_link():
+    # A bare package becomes market://launch?id=..., which the Shield rejects.
+    for app in DEFAULT_APPS.values():
+        assert app.target.startswith("https://") and app.package
+
+
 def test_user_apps_merge_and_reverse_lookup(settings):
     assert settings.resolve_app(" Netflix ") == DEFAULT_APPS["netflix"]
-    assert settings.resolve_app("mine") == "com.example.mine"  # "Mine" lowercased
+    assert settings.resolve_app("mine") == App("com.example.mine", "com.example.mine")  # "Mine" lowercased
     assert settings.resolve_app("nope") is None
+    assert settings.app_name_for("com.netflix.ninja") == "netflix"
     assert settings.app_name_for("com.example.mine") == "mine"
     assert settings.app_name_for("com.unknown") is None
     assert settings.app_name_for(None) is None
@@ -51,7 +59,21 @@ def test_user_apps_merge_and_reverse_lookup(settings):
 
 def test_user_app_overrides_default(config_dir):
     (config_dir / "config.json").write_text(json.dumps({"apps": {"netflix": "com.example.other"}}))
-    assert load_settings().resolve_app("netflix") == "com.example.other"
+    assert load_settings().resolve_app("netflix") == App("com.example.other", "com.example.other")
+
+
+def test_user_app_forms(config_dir):
+    apps = {
+        "link": "https://example.com/watch",
+        "both": {"link": "https://example.com/tv", "package": "com.example.tv"},
+        "bad": 42,
+        "no-link": {"package": "com.example.x"},
+    }
+    (config_dir / "config.json").write_text(json.dumps({"apps": apps}))
+    s = load_settings()
+    assert s.resolve_app("link") == App("https://example.com/watch", None)  # package unknown
+    assert s.resolve_app("both") == App("https://example.com/tv", "com.example.tv")
+    assert s.resolve_app("bad") is None and s.resolve_app("no-link") is None
 
 
 def test_host_precedence(config_dir, monkeypatch):

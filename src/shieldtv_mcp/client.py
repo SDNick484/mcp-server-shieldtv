@@ -29,9 +29,14 @@ from androidtvremote2 import (
 from mcp.server.mcpserver.exceptions import ToolError
 from typing_extensions import TypedDict
 
-from .config import ALLOWED_KEYS, CLIENT_NAME, Settings
+from .config import ALLOWED_KEYS, CLIENT_NAME, App, Settings
 
 log = logging.getLogger(__name__)
+
+# Home-screen packages (Android TV, Google TV). Landing on one never means a
+# launch worked: on real hardware, the launcher's own "now in front" push
+# after a HOME key can arrive just after a launch request is sent.
+LAUNCHERS = frozenset({"com.google.android.tvlauncher", "com.google.android.apps.tv.launcherx"})
 
 
 class ShieldError(ToolError):
@@ -84,10 +89,20 @@ class ShieldClient:
       auth_failed - the Shield rejected our certificate. Retrying won't help;
                     only re-pairing will, so it is tracked apart from available.
       is_on, current_app, volume - last pushed values; None until first known.
+      drops       - how many times the connection has been lost. A counter, not
+                    a flag: the library reconnects within ~0.1s, so a drop can
+                    come and go between two looks at ``available``.
 
     Everything runs on the server's single asyncio event loop, so the callbacks
     and tools never run at the same time and need no locks.
     """
+
+    # How long launch() and set_power() wait to see the result, and how often
+    # they look. Class attributes so tests can shorten them. A cold YouTube
+    # start on a real Shield took over 5s; power changes were reported at once.
+    launch_timeout = 10.0
+    power_timeout = 5.0
+    poll_interval = 0.25
 
     def __init__(self, settings: Settings, remote_factory: RemoteFactory = AndroidTVRemote) -> None:
         self.settings = settings
@@ -99,6 +114,7 @@ class ShieldClient:
         self.is_on: bool | None = None
         self.current_app: str | None = None
         self.volume: VolumeInfo | None = None
+        self.drops = 0
 
     # --- lifecycle ---------------------------------------------------------
     async def start(self) -> None:
@@ -168,6 +184,8 @@ class ShieldClient:
         self.volume = value
 
     def _set_available(self, value: bool) -> None:
+        if self.available and not value:
+            self.drops += 1
         self.available = value
 
     def _on_invalid_auth(self) -> None:
@@ -195,12 +213,71 @@ class ShieldClient:
             raise ShieldError(f"Key {key!r} is not allowed.")
         self._run(lambda r: r.send_key_command(key))
 
-    def set_power(self, on: bool) -> None:
-        # WAKEUP/SLEEP are explicit; the POWER key is a toggle and is not allowed.
-        self._run(lambda r: r.send_key_command("WAKEUP" if on else "SLEEP"))
+    async def set_power(self, on: bool) -> None:
+        """Wake or sleep the Shield and confirm it reported the new state.
 
-    def launch(self, target: str) -> None:
-        self._run(lambda r: r.send_launch_app_command(target))
+        WAKEUP/SLEEP are explicit; the POWER key is a toggle and is not allowed.
+        Like launch(), a sent key proves nothing, so wait for the pushed is_on.
+        """
+        self._run(lambda r: r.send_key_command("WAKEUP" if on else "SLEEP"))
+        if not await self._wait_for(lambda: self.is_on is on, self.power_timeout):
+            state = {True: "on", False: "standby", None: "unknown"}[self.is_on]
+            raise ShieldError(
+                f"Sent {'WAKEUP' if on else 'SLEEP'}, but the Shield didn't report the change within "
+                f"{self.power_timeout:.0f}s (it still reports {state}). Check get_status before retrying."
+            )
+
+    async def launch(self, app: App) -> str:
+        """Launch app and confirm it reached the foreground; return its package.
+
+        The library's launch is fire-and-forget, and a sent request proves
+        nothing. On real hardware a launch fails in two quiet ways:
+          - the Shield rejects the link: it replies with an error that the
+            library only logs, then drops the connection (counted in drops);
+          - the Shield accepts it, but nothing opens (app not installed, or no
+            app handles the link), so the foreground app never changes.
+        So instead of trusting the send, watch what the Shield pushes back.
+        """
+        before = self.current_app
+        drops = self.drops
+        self._run(lambda r: r.send_launch_app_command(app.target))
+
+        def opened() -> bool:
+            if self.drops != drops:
+                raise ShieldError(
+                    f"The Shield rejected the launch request for {app.target} and dropped the connection "
+                    "(it reconnects on its own). Bare package names are rejected; use an https link."
+                )
+            now = self.current_app
+            # With a known package, being in front is success, even if it
+            # already was. Without one, a change to some app other than the
+            # home screen counts.
+            if app.package:
+                return now == app.package
+            return bool(now) and now != before and now not in LAUNCHERS
+
+        if await self._wait_for(opened, self.launch_timeout):
+            assert self.current_app is not None
+            return self.current_app
+        raise ShieldError(
+            f"The Shield accepted {app.target}, but the foreground app didn't change within "
+            f"{self.launch_timeout:.0f}s (still {self.current_app or 'unknown'}). The app may not be "
+            "installed, or no installed app handles that link; the TV may be showing an error."
+        )
+
+    async def _wait_for(self, condition: Callable[[], bool], timeout: float) -> bool:
+        """Poll condition() while the library's callbacks update state; False on timeout.
+
+        Polling (rather than an Event per callback) keeps the state callbacks
+        trivial, and a few checks a second is plenty for a TV.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while loop.time() < deadline:
+            await asyncio.sleep(self.poll_interval)
+            if condition():
+                return True
+        return False
 
     def _run(self, fn: Callable[[AndroidTVRemote], None]) -> None:
         remote = self._require()
@@ -216,7 +293,10 @@ class ShieldClient:
     def snapshot(self) -> Status:
         # The library hands volume and device info over as plain dicts
         # (TypedDicts), not objects: index them, don't use attributes.
-        vol = self.volume
+        # Volume max 0 means the Shield isn't reporting volume, typically
+        # because HDMI-CEC hands it to a TV or receiver. Report that as unknown,
+        # not as "level 0 of 0".
+        vol = self.volume if self.volume and self.volume["max"] > 0 else None
         info = self._remote.device_info if self._remote else None
         return {
             "host": self.settings.host,

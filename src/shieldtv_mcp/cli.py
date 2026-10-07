@@ -109,6 +109,11 @@ async def _cmd_pair(host_arg: str | None) -> int:
             code = (await asyncio.to_thread(input, "Enter the code shown on the TV: ")).strip()
             await remote.async_finish_pairing(code)
             break
+        except EOFError:
+            # stdin isn't a terminal (e.g. launched from a tool or with < /dev/null).
+            print("\nNo input to read the code from; run `pair` in an interactive terminal.", file=sys.stderr)
+            remote.disconnect()
+            return 1
         except (InvalidAuth, ConnectionClosed):
             print("That didn't work (wrong code or the session timed out).")
             if attempt == 2:

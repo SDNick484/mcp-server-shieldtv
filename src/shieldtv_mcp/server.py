@@ -94,8 +94,8 @@ def get_status() -> Status:
 
 @mcp.tool(title="List launchable apps", annotations=_READ)
 def list_apps() -> dict[str, str]:
-    """List the app names launch_app accepts (friendly name -> package or link)."""
-    return dict(client().settings.apps)
+    """List the app names launch_app accepts (friendly name -> the link it opens)."""
+    return {name: app.target for name, app in client().settings.apps.items()}
 
 
 # Constraints written into the type become JSON Schema the model sees
@@ -114,21 +114,27 @@ def send_key(key: KeyName, repeat: Repeat = 1) -> str:
 
 
 @mcp.tool(title="Launch an app", annotations=_ACT_IDEMPOTENT)
-def launch_app(
+async def launch_app(
     app: Annotated[str, Field(description="Friendly app name from list_apps, e.g. 'netflix'.")],
 ) -> str:
-    """Launch an app by friendly name (see list_apps), e.g. 'netflix' or 'youtube'."""
+    """Launch an app by friendly name (see list_apps), e.g. 'netflix' or 'youtube'.
+
+    Succeeds only once the app is confirmed in the foreground; otherwise the error says what the Shield did.
+    """
     c = client()
-    target = c.settings.resolve_app(app)
-    if target is None:
+    resolved = c.settings.resolve_app(app)
+    if resolved is None:
         names = ", ".join(sorted(c.settings.apps))
         raise ShieldError(f"Unknown app {app!r}. Known apps: {names}")
-    c.launch(target)
-    return f"Launched {app.strip().lower()} ({target})"
+    package = await c.launch(resolved)
+    return f"Launched {app.strip().lower()} ({package} is in the foreground)"
 
 
 @mcp.tool(title="Wake or sleep the Shield", annotations=_ACT_IDEMPOTENT)
-def set_power(state: Literal["on", "off"]) -> str:
-    """Wake the Shield ('on') or put it to sleep ('off'). Uses WAKEUP/SLEEP, not the POWER toggle."""
-    client().set_power(state == "on")
-    return f"Requested power {state}"
+async def set_power(state: Literal["on", "off"]) -> str:
+    """Wake the Shield ('on') or put it to sleep ('off'). Uses WAKEUP/SLEEP, not the POWER toggle.
+
+    Succeeds only once the Shield reports the new state.
+    """
+    await client().set_power(state == "on")
+    return "The Shield is on" if state == "on" else "The Shield is in standby"

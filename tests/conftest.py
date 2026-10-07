@@ -9,6 +9,7 @@ from collections.abc import Callable
 import pytest
 from androidtvremote2 import ConnectionClosed, DeviceInfo, VolumeInfo
 
+from shieldtv_mcp.client import ShieldClient
 from shieldtv_mcp.config import Settings, load_settings
 
 
@@ -36,6 +37,11 @@ class FakeRemote:
         self.closed = False  # True makes commands raise ConnectionClosed
         self.keys: list[str] = []
         self.launched: list[str] = []
+        # What the "Shield" does with a launch target, like the real one does
+        # after a moment: open a package, or "reject" (error, then the
+        # connection drops and comes back). Unlisted targets open nothing.
+        self.launch_outcomes: dict[str, str] = {}
+        self.ignore_power = False  # True: WAKEUP/SLEEP change nothing
         self.reconnecting = False
         self.invalid_auth_callback: Callable[[], None] | None = None
         self.disconnected = False
@@ -90,14 +96,32 @@ class FakeRemote:
         if self.closed:
             raise ConnectionClosed("closed")
         self.keys.append(key_code)
+        # The real Shield pushes its new power state right after these.
+        if key_code in ("WAKEUP", "SLEEP") and not self.ignore_power:
+            asyncio.get_running_loop().call_soon(self.push, "is_on", key_code == "WAKEUP")
 
     def send_launch_app_command(self, app_link_or_app_id: str) -> None:
         if self.closed:
             raise ConnectionClosed("closed")
         self.launched.append(app_link_or_app_id)
+        outcome = self.launch_outcomes.get(app_link_or_app_id)
+        loop = asyncio.get_running_loop()
+        if outcome == "reject":
+            loop.call_soon(self.push, "is_available", False)
+            loop.call_soon(self.push, "is_available", True)
+        elif outcome:
+            loop.call_soon(self.push, "current_app", outcome)
 
     def disconnect(self) -> None:
         self.disconnected = True
+
+
+@pytest.fixture(autouse=True)
+def fast_launch(monkeypatch):
+    """Keep launch and power confirmation waits short; the fake answers at once."""
+    monkeypatch.setattr(ShieldClient, "launch_timeout", 0.2)
+    monkeypatch.setattr(ShieldClient, "power_timeout", 0.2)
+    monkeypatch.setattr(ShieldClient, "poll_interval", 0.01)
 
 
 @pytest.fixture

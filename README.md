@@ -103,10 +103,10 @@ When the host is set in more than one place, the most specific wins: `pair --hos
 
 | Tool | What it does |
 |---|---|
-| `get_status` | Reachability, power (`on`/`standby`), foreground app, volume, device info |
+| `get_status` | Reachability, power (`on`/`standby`), foreground app, volume (`null` when not reported), device info |
 | `list_apps` | The app names `launch_app` accepts |
 | `send_key` | Press an allow-listed remote key, optionally repeated 1-10 times (see below) |
-| `launch_app` | Launch an allow-listed app by friendly name |
+| `launch_app` | Launch an allow-listed app by friendly name, and confirm it reached the foreground |
 | `set_power` | Wake (`on`) or sleep (`off`) using `WAKEUP`/`SLEEP`, not the `POWER` toggle |
 
 This protocol reports the foreground *app* but not what is playing (title, artist,
@@ -117,20 +117,40 @@ Allowed keys: `HOME`, `BACK`, `MENU`, `DPAD_UP`/`DOWN`/`LEFT`/`RIGHT`/`CENTER`,
 `MEDIA_PREVIOUS`, `MEDIA_REWIND`, `MEDIA_FAST_FORWARD`, `VOLUME_UP`, `VOLUME_DOWN`,
 `VOLUME_MUTE`.
 
+### Apps
+
+Default apps, each checked on a real Shield: `youtube`, `netflix`, `prime-video`.
+
+Apps launch through **https deep links**. On the Shield (remote service 7.x), a bare
+package name is sent as `market://launch?id=<package>`, which the Shield rejects and then
+drops the connection. `launch_app` waits for the app to reach the foreground (up to 10s)
+and returns an error that says what happened if it doesn't: the request was rejected, or it
+was accepted but nothing opened (the app isn't installed, or no app handles the link; the
+TV shows "You don't have an app that can do this").
+
 ### Add your own apps
 
 Edit `~/.config/mcp-server-shieldtv/config.json`:
 
 ```json
-{ "host": "192.168.1.50", "apps": { "crunchyroll": "com.crunchyroll.crunchyroid" } }
+{
+  "host": "192.168.1.50",
+  "apps": {
+    "crunchyroll": { "link": "https://www.crunchyroll.com", "package": "com.crunchyroll.crunchyroid" },
+    "example": "https://example.com/tv"
+  }
+}
 ```
 
+An entry is either a link, or `{ "link", "package" }`. Adding the package is recommended:
+`launch_app` then confirms that exact app opened, and `get_status` shows the friendly name.
+Without it, any app other than the home screen coming to the front counts as success.
 Names are case-insensitive, and an entry with the same name as a default replaces it.
 Restart the server (or your MCP client) to pick up changes.
 
-**Finding a package name:** open the app on the Shield, then call `get_status` (or ask
-"what app is open on the Shield?"). `current_app_package` is the value to put in
-`config.json`.
+**Finding the link and package:** try the service's website address (`https://www.<service>.com`)
+as the link. Open the app on the Shield, then call `get_status` (or ask "what app is open on
+the Shield?"); `current_app_package` is the package.
 
 ## Safety design
 
@@ -151,7 +171,8 @@ Restart the server (or your MCP client) to pick up changes.
   asleep or offline at startup it retries in the background, and tool calls return a clear
   "can't reach the Shield" message in the meantime.
 - Volume keys act on whatever the Shield is configured to control (the Shield itself, HDMI-CEC,
-  or IR), so results depend on your setup.
+  or IR), so results depend on your setup. When volume goes to a TV or receiver over CEC, the
+  Shield doesn't report a level, and `get_status` returns `volume: null`.
 
 ## Troubleshooting
 
@@ -173,6 +194,16 @@ the background, so the next call may succeed without a restart.
 
 **"The connection to the Shield dropped; try again in a moment."** The connection closed
 during the command. The library reconnects on its own; retry.
+
+**"The Shield rejected the launch request ..."** The app entry is a bare package name (or a
+link the Shield refuses). Use an https link; see [Apps](#apps).
+
+**"The Shield accepted ..., but the foreground app didn't change"** The app is probably not
+installed, or nothing on the Shield handles that link. A very slow cold start can also do
+this; the next call then reports the app as already open.
+
+**`pair` says "No input to read the code from".** It was run without a terminal (for
+example through a tool that doesn't attach one). Run it in a regular terminal.
 
 **`discover` (or `pair` without `--host`) finds nothing.** mDNS doesn't cross most VLANs or
 guest networks, and on WSL2 it needs mirrored networking (see above). Pass `--host <ip>`;
@@ -202,8 +233,8 @@ To poke at the tools interactively: `npx @modelcontextprotocol/inspector mcp-ser
 
 ## Roadmap
 
-- Verify against real hardware: connect, key presses, app launch, `WAKEUP`/`SLEEP` behavior
-- Check which package names and deep links work on the Shield for each default app
+- Find working links for more apps (Plex, Disney+, Hulu, Spotify, Kodi were dropped from the
+  defaults until checked on a Shield that has them installed)
 - Optional ADB-backed read-only tools (now playing), kept separate and typed
 - Publish to PyPI and the MCP registry
 

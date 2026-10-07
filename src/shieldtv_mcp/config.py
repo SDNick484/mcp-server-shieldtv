@@ -11,12 +11,16 @@ Shield, so the directory is created 0700 and the files 0600.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, get_args
+from urllib.parse import urlparse
 
 CLIENT_NAME = "mcp-server-shieldtv"
+
+log = logging.getLogger(__name__)
 
 # --- Allow-lists -----------------------------------------------------------
 # The model can only press keys named here. Each name is a RemoteKeyCode from
@@ -47,20 +51,43 @@ KeyName = Literal[
 ]
 ALLOWED_KEYS: frozenset[str] = frozenset(get_args(KeyName))
 
-# Friendly name -> package name (or deep link). Extend per-user through the
-# "apps" object in config.json; user entries win over these defaults.
-# Unverified: these are the usual Android TV package names, not yet checked
-# on a real Shield.
-DEFAULT_APPS: dict[str, str] = {
-    "netflix": "com.netflix.ninja",
-    "youtube": "com.google.android.youtube.tv",
-    "plex": "com.plexapp.android",
-    "disney+": "com.disney.disneyplus",
-    "prime-video": "com.amazon.amazonvideo.livingroom",
-    "hulu": "com.hulu.livingroomplus",
-    "spotify": "com.spotify.tv.android",
-    "kodi": "org.xbmc.kodi",
+
+@dataclass(frozen=True)
+class App:
+    """What launch_app sends, and how to recognize the app once it is open.
+
+    target  - an https deep link, or a bare package name. The library turns a
+              bare package into ``market://launch?id=<package>``, which the
+              Shield (remote service 7.x) rejects, so links are the default.
+    package - the Android package that should reach the foreground. Used to
+              confirm a launch worked and to name the app in get_status.
+              None means "unknown": any change of foreground app counts.
+    """
+
+    target: str
+    package: str | None = None
+
+
+# Friendly name -> app. Extend per-user through the "apps" object in
+# config.json; user entries win over these defaults. Each of these was
+# checked on a real Shield (2026-10): the link opened that package.
+DEFAULT_APPS: dict[str, App] = {
+    "youtube": App("https://www.youtube.com", "com.google.android.youtube.tv"),
+    "netflix": App("https://www.netflix.com/title", "com.netflix.ninja"),
+    "prime-video": App("https://app.primevideo.com", "com.amazon.amazonvideo.livingroom"),
 }
+
+
+def _parse_app(value: Any) -> App | None:
+    """A config.json entry: a link or package string, or {"link", "package"}."""
+    if isinstance(value, str) and value.strip():
+        target = value.strip()
+        # A bare package name is also the package that will be in front.
+        return App(target, None if urlparse(target).scheme else target)
+    if isinstance(value, dict) and isinstance(value.get("link"), str):
+        package = value.get("package")
+        return App(value["link"], package if isinstance(package, str) else None)
+    return None
 
 
 # --- Locations -------------------------------------------------------------
@@ -77,7 +104,7 @@ class Settings:
     host: str | None
     cert_path: Path
     key_path: Path
-    apps: dict[str, str]
+    apps: dict[str, App]
 
     @property
     def paired(self) -> bool:
@@ -85,15 +112,15 @@ class Settings:
         Shield still accepts them; ShieldClient.auth_failed tracks that."""
         return bool(self.host) and self.cert_path.is_file() and self.key_path.is_file()
 
-    def resolve_app(self, name: str) -> str | None:
+    def resolve_app(self, name: str) -> App | None:
         return self.apps.get(name.strip().lower())
 
     def app_name_for(self, package: str | None) -> str | None:
         """Reverse lookup so get_status can say 'netflix' instead of a package."""
         if not package:
             return None
-        for friendly, target in self.apps.items():
-            if target == package:
+        for friendly, app in self.apps.items():
+            if app.package == package:
                 return friendly
         return None
 
@@ -109,7 +136,15 @@ def _read_json(path: Path) -> dict[str, Any]:
 def load_settings(host_override: str | None = None) -> Settings:
     d = config_dir()
     data = _read_json(d / "config.json")
-    apps = {**DEFAULT_APPS, **{k.lower(): v for k, v in data.get("apps", {}).items()}}
+    user_apps = data.get("apps", {})
+    apps = dict(DEFAULT_APPS)
+    if isinstance(user_apps, dict):
+        for name, value in user_apps.items():
+            app = _parse_app(value)
+            if app is None:
+                log.warning("Ignoring app %r in config.json: expected a string or {link, package}", name)
+            else:
+                apps[name.lower()] = app
     # Most specific wins: `pair --host`, then the environment, then config.json.
     host = host_override or os.environ.get("SHIELDTV_HOST") or data.get("host")
     return Settings(host=host, cert_path=d / "cert.pem", key_path=d / "key.pem", apps=apps)
