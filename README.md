@@ -1,5 +1,7 @@
 # mcp-server-shieldtv
 
+[![CI](https://github.com/SDNick484/mcp-server-shieldtv/actions/workflows/ci.yml/badge.svg)](https://github.com/SDNick484/mcp-server-shieldtv/actions/workflows/ci.yml)
+
 An [MCP](https://modelcontextprotocol.io) server for the **NVIDIA Shield TV**, built on the
 Android TV Remote protocol v2 (the same protocol the Google TV phone app uses). It lets an
 MCP client such as Claude press remote keys, launch apps, wake or sleep the Shield, and
@@ -35,7 +37,17 @@ Requires Python 3.11+.
 
 ## Pair with your Shield (once)
 
-The Shield and the machine running the server must be on the same network.
+The Shield and the machine running the server must be on the same network, and the
+machine must be able to reach the Shield on these ports:
+
+| Port | Used for |
+|---|---|
+| TCP 6466 | Remote control (every tool call) |
+| TCP 6467 | Pairing (only during `pair`) |
+| UDP 5353 (mDNS) | `discover`, and `pair` without `--host` |
+
+A firewall, a guest network, or a separate IoT VLAN between the two will show up as
+"can't reach the Shield".
 
 ```sh
 mcp-server-shieldtv discover            # optional: list Android TV devices via mDNS
@@ -64,6 +76,28 @@ WSL2 note: mDNS discovery needs mirrored networking (`networkingMode=mirrored` i
 ```
 
 For Claude Code: `claude mcp add shieldtv -- /path/to/.venv/bin/mcp-server-shieldtv`.
+To point it at a particular Shield without editing `config.json`, pass the host as an
+environment variable: `claude mcp add shieldtv -e SHIELDTV_HOST=192.168.1.50 -- ...`.
+That Shield must already be paired with the same credentials (`pair --host <ip>` once per
+Shield; note that `pair` also saves its host as the default in `config.json`).
+
+## Configuration
+
+| Setting | Default | What it does |
+|---|---|---|
+| `SHIELDTV_HOST` | *(from `config.json`)* | The Shield's IP address or hostname |
+| `SHIELDTV_CONFIG_DIR` | `$XDG_CONFIG_HOME/mcp-server-shieldtv` | Where the certificate, key and `config.json` live |
+| `XDG_CONFIG_HOME` | `~/.config` | Standard base directory, used when `SHIELDTV_CONFIG_DIR` is unset |
+
+`config.json` (written by `pair`, safe to edit by hand):
+
+| Key | What it does |
+|---|---|
+| `host` | The Shield's address, saved by `pair` |
+| `apps` | Extra or overriding app names for `launch_app` (see below) |
+
+When the host is set in more than one place, the most specific wins: `pair --host`, then
+`SHIELDTV_HOST`, then `config.json`.
 
 ## Tools
 
@@ -91,6 +125,13 @@ Edit `~/.config/mcp-server-shieldtv/config.json`:
 { "host": "192.168.1.50", "apps": { "crunchyroll": "com.crunchyroll.crunchyroid" } }
 ```
 
+Names are case-insensitive, and an entry with the same name as a default replaces it.
+Restart the server (or your MCP client) to pick up changes.
+
+**Finding a package name:** open the app on the Shield, then call `get_status` (or ask
+"what app is open on the Shield?"). `current_app_package` is the value to put in
+`config.json`.
+
 ## Safety design
 
 - **Keys are an allow-list.** The tool schema is an enum, and the client re-checks it.
@@ -111,6 +152,36 @@ Edit `~/.config/mcp-server-shieldtv/config.json`:
   "can't reach the Shield" message in the meantime.
 - Volume keys act on whatever the Shield is configured to control (the Shield itself, HDMI-CEC,
   or IR), so results depend on your setup.
+
+## Troubleshooting
+
+The server's errors are written to be actionable, so the model will usually relay one of
+these:
+
+**"Not paired with a Shield yet."** No host or credentials were found. Run
+`mcp-server-shieldtv pair`. If you did pair, check that the server and `pair` use the same
+`SHIELDTV_CONFIG_DIR` (an MCP client may launch the server with a different environment).
+
+**"The Shield rejected our pairing."** The Shield no longer trusts this certificate,
+typically after a factory reset or after removing the device under the Shield's
+remote/connected-device settings. Run `pair` again.
+
+**"Can't reach the Shield at ..."** The server is paired but has no connection. The Shield
+may be asleep, rebooting, or off the network, its IP may have changed (a DHCP reservation
+helps), or TCP 6466 may be blocked (see the port table above). The server keeps retrying in
+the background, so the next call may succeed without a restart.
+
+**"The connection to the Shield dropped; try again in a moment."** The connection closed
+during the command. The library reconnects on its own; retry.
+
+**`discover` (or `pair` without `--host`) finds nothing.** mDNS doesn't cross most VLANs or
+guest networks, and on WSL2 it needs mirrored networking (see above). Pass `--host <ip>`;
+the Shield shows its IP in its network/about settings, and your router's client list has
+it too.
+
+Server logs (connection attempts, retries, auth failures) go to stderr, which most MCP
+clients save in their own logs. Running `mcp-server-shieldtv` in a terminal shows them
+directly; it waits for MCP messages on stdin, so stop it with Ctrl+C.
 
 ## Development
 
