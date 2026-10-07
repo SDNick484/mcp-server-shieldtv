@@ -17,3 +17,7 @@ venv/
 cert.pem
 key.pem
 config.json
+
+# ADB key from `adb-setup`. It grants a shell on the Shield; never commit it.
+adbkey
+adbkey.pub

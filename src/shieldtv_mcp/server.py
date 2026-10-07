@@ -22,6 +22,7 @@ from mcp.server import MCPServer
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
+from .adb import NowPlaying, read_now_playing
 from .client import ShieldClient, ShieldError, Status
 from .config import KeyName, load_settings
 
@@ -59,7 +60,8 @@ mcp = MCPServer(
     "shieldtv",
     instructions=(
         "Controls an NVIDIA Shield TV over the Android TV Remote protocol. "
-        "Call get_status first to see whether it is on and what app is in the foreground. "
+        "Call get_status first to see whether it is on and what app is in the foreground, "
+        "and get_now_playing for the title and play state. "
         "The Shield must have been paired once with `mcp-server-shieldtv pair`."
     ),
     lifespan=lifespan,
@@ -87,9 +89,19 @@ _ACT_IDEMPOTENT = ToolAnnotations(
 def get_status() -> Status:
     """Report whether the Shield is reachable, its power state, the foreground app, and volume.
 
-    Note: this protocol does not expose what is playing (title/artist/position).
+    It does not say what is playing; get_now_playing does (if ADB is set up).
     """
     return client().snapshot()
+
+
+@mcp.tool(title="Get what's playing", annotations=_READ)
+async def get_now_playing() -> NowPlaying:
+    """Report what is playing: app, title, subtitle (artist or channel), play state, position in seconds.
+
+    state is "idle" when nothing is playing. position_s is null for live TV. Needs ADB, enabled once with
+    `mcp-server-shieldtv adb-setup`; without it this returns an error saying so.
+    """
+    return await read_now_playing(client().settings)
 
 
 @mcp.tool(title="List launchable apps", annotations=_READ)

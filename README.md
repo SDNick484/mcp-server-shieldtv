@@ -21,8 +21,9 @@ This is not an official NVIDIA project, and NVIDIA publishes no MCP server for t
 | Good for | D-pad, media keys, app launch, power/app state | Deep device inspection |
 | Risk if exposed to an LLM | Bounded: it can only press keys | High: `adb shell` is arbitrary code execution |
 
-ADB features (such as now-playing metadata) may come later as separate, typed tools. The
-server will never expose a raw shell.
+One optional ADB feature, `get_now_playing`, reads media metadata the remote protocol
+doesn't expose. It is off until you run `adb-setup`, and it runs a single fixed, read-only
+command; the server never exposes a raw shell (see [What's playing](#whats-playing-optional-adb)).
 
 ## Install
 
@@ -45,6 +46,7 @@ machine must be able to reach the Shield on these ports:
 | TCP 6466 | Remote control (every tool call) |
 | TCP 6467 | Pairing (only during `pair`) |
 | UDP 5353 (mDNS) | `discover`, and `pair` without `--host` |
+| TCP 5555 | ADB, only if you enable `get_now_playing` with `adb-setup` |
 
 A firewall, a guest network, or a separate IoT VLAN between the two will show up as
 "can't reach the Shield".
@@ -64,6 +66,27 @@ them. To revoke access, remove the device from the Shield's settings and re-pair
 
 WSL2 note: mDNS discovery needs mirrored networking (`networkingMode=mirrored` in
 `%UserProfile%\.wslconfig`, then `wsl --shutdown`). Otherwise pass `--host`.
+
+### What's playing (optional, ADB)
+
+The remote protocol knows which app is in front, not what it's playing. Android's media
+sessions do, and `get_now_playing` reads them over ADB. To enable it:
+
+1. On the Shield: Settings > Device Preferences > About, select **Build** seven times, then
+   Developer options > **Network debugging** on.
+2. Run `mcp-server-shieldtv adb-setup` (after `pair`). The TV asks "Allow USB debugging?":
+   tick "Always allow from this computer" and choose Allow.
+
+`adb-setup` creates its own ADB key (`adbkey`, `adbkey.pub`, `0600`) next to the pairing
+files and sets `"adb": true` in `config.json`. **The ADB key grants a shell on the Shield;
+guard it more carefully than the pairing files.** To revoke it, use Developer options >
+Revoke USB debugging authorizations.
+
+What it reports, checked on a real Shield: the app, title, subtitle (the artist for music,
+the channel for live TV), play state, and position. Live TV (YouTube TV, Sling) reports no
+position, since its "position" is an offset into the stream. Music played from YouTube Music
+shows up as the YouTube app. Duration and album aren't available this way. A title that
+contains ", " can rarely split wrong (the system prints title and artist joined by ", ").
 
 ## Use it with an MCP client
 
@@ -95,6 +118,7 @@ Shield; note that `pair` also saves its host as the default in `config.json`).
 |---|---|
 | `host` | The Shield's address, saved by `pair` |
 | `apps` | Extra or overriding app names for `launch_app` (see below) |
+| `adb` | `true` once `adb-setup` succeeds; enables `get_now_playing` |
 
 When the host is set in more than one place, the most specific wins: `pair --host`, then
 `SHIELDTV_HOST`, then `config.json`.
@@ -108,9 +132,9 @@ When the host is set in more than one place, the most specific wins: `pair --hos
 | `send_key` | Press an allow-listed remote key, optionally repeated 1-10 times (see below) |
 | `launch_app` | Launch an allow-listed app by friendly name, and confirm it reached the foreground |
 | `set_power` | Wake (`on`) or sleep (`off`) using `WAKEUP`/`SLEEP`, not the `POWER` toggle |
+| `get_now_playing` | App, title, subtitle (artist or channel), play state and position. Needs `adb-setup` |
 
-This protocol reports the foreground *app* but not what is playing (title, artist,
-position). `get_status` returns structured content with a published output schema.
+`get_status` and `get_now_playing` return structured content with a published output schema.
 
 Allowed keys: `HOME`, `BACK`, `MENU`, `DPAD_UP`/`DOWN`/`LEFT`/`RIGHT`/`CENTER`,
 `MEDIA_PLAY_PAUSE`, `MEDIA_PLAY`, `MEDIA_PAUSE`, `MEDIA_STOP`, `MEDIA_NEXT`,
@@ -170,8 +194,10 @@ app, the app usually still opens, but its own scheme (if it has one) avoids the 
   `POWER`, `SEARCH` (starts voice capture), `SETTINGS`, `MUTE` (Android's *microphone*
   mute), raw numeric key codes, and the library's `text:` typing are not available.
 - **Apps are an allow-list.** Only names in `list_apps` can be launched.
-- **No shell, no ADB, no arbitrary key codes**, so a prompt-injected model has a small blast
-  radius.
+- **No shell and no arbitrary key codes**, so a prompt-injected model has a small blast
+  radius. ADB is off by default. When enabled, `get_now_playing` takes no arguments and runs
+  one constant command (`dumpsys media_session` plus `/proc/uptime`), so nothing the model
+  writes reaches the Shield's shell.
 - **Credentials are private** (`0600`) and never logged. Logs go to stderr because stdout
   belongs to the MCP transport.
 - Tools carry titles and MCP annotations (`readOnlyHint`, `destructiveHint`,
@@ -245,7 +271,6 @@ To poke at the tools interactively: `npx @modelcontextprotocol/inspector mcp-ser
 
 ## Roadmap
 
-- Optional ADB-backed read-only tools (now playing), kept separate and typed
 - Publish to PyPI and the MCP registry
 
 ## License

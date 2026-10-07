@@ -22,6 +22,7 @@ dependencies = [
     "androidtvremote2>=0.3.2",
     "zeroconf>=0.130",
     "typing_extensions>=4.7",
+    "adb-shell[async]>=0.4.4",
 ]
 
 [project.urls]
@@ -51,3 +52,7 @@ select = ["E", "W", "F", "I", "UP", "B", "SIM"]
 [tool.mypy]
 files = ["src"]
 strict = true
+
+[[tool.mypy.overrides]]
+module = ["adb_shell.*"]  # ships no type hints
+ignore_missing_imports = true

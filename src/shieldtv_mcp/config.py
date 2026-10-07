@@ -1,11 +1,13 @@
 """Settings, file locations, and the allow-lists that bound what the model can do.
 
 Everything the server persists lives in one directory (default
-``~/.config/mcp-server-shieldtv``): the pairing certificate and key, plus a
-small ``config.json`` holding the Shield's host and any extra apps.
+``~/.config/mcp-server-shieldtv``): the pairing certificate and key, the
+optional ADB key (``adbkey``, ``adbkey.pub``), plus a small ``config.json``
+holding the Shield's host, any extra apps, and whether ADB is enabled.
 
 The cert/key pair *is* the credential: anyone holding it can control the
-Shield, so the directory is created 0700 and the files 0600.
+Shield, and the ADB key grants a shell on it. So the directory is created
+0700 and the files 0600.
 """
 
 from __future__ import annotations
@@ -113,6 +115,9 @@ class Settings:
     cert_path: Path
     key_path: Path
     apps: dict[str, App]
+    # Opt-in: set by `adb-setup` once the Shield has accepted adb_key_path.
+    adb: bool = False
+    adb_key_path: Path | None = None
 
     @property
     def paired(self) -> bool:
@@ -155,7 +160,14 @@ def load_settings(host_override: str | None = None) -> Settings:
                 apps[name.lower()] = app
     # Most specific wins: `pair --host`, then the environment, then config.json.
     host = host_override or os.environ.get("SHIELDTV_HOST") or data.get("host")
-    return Settings(host=host, cert_path=d / "cert.pem", key_path=d / "key.pem", apps=apps)
+    return Settings(
+        host=host,
+        cert_path=d / "cert.pem",
+        key_path=d / "key.pem",
+        apps=apps,
+        adb=data.get("adb") is True,
+        adb_key_path=d / "adbkey",
+    )
 
 
 def ensure_private_dir() -> Path:
@@ -166,15 +178,23 @@ def ensure_private_dir() -> Path:
 
 
 def lock_down_credentials(settings: Settings) -> None:
-    for p in (settings.cert_path, settings.key_path):
+    paths = [settings.cert_path, settings.key_path]
+    if settings.adb_key_path:
+        paths += [settings.adb_key_path, settings.adb_key_path.with_name(settings.adb_key_path.name + ".pub")]
+    for p in paths:
         if p.exists():
             p.chmod(0o600)
 
 
-def save_host(host: str) -> None:
+def save_config(**values: Any) -> None:
+    """Merge values into config.json, keeping whatever else is there."""
     d = ensure_private_dir()
     path = d / "config.json"
     data = _read_json(path)
-    data["host"] = host
+    data.update(values)
     path.write_text(json.dumps(data, indent=2) + "\n")
     path.chmod(0o600)
+
+
+def save_host(host: str) -> None:
+    save_config(host=host)

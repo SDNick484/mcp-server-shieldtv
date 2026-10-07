@@ -38,7 +38,14 @@ def text(result) -> str:
 
 # --- tools/list --------------------------------------------------------------
 async def test_tool_names(mcp_client):
-    assert set(await tools(mcp_client)) == {"get_status", "list_apps", "send_key", "launch_app", "set_power"}
+    assert set(await tools(mcp_client)) == {
+        "get_status",
+        "get_now_playing",
+        "list_apps",
+        "send_key",
+        "launch_app",
+        "set_power",
+    }
 
 
 async def test_every_tool_has_title_description_and_annotations(mcp_client):
@@ -58,6 +65,7 @@ async def test_annotations_match_behavior(mcp_client):
     t = await tools(mcp_client)
     assert t["get_status"].annotations.read_only_hint is True
     assert t["list_apps"].annotations.read_only_hint is True
+    assert t["get_now_playing"].annotations.read_only_hint is True
     assert t["send_key"].annotations.idempotent_hint is False  # DPAD_DOWN twice moves twice
     assert t["launch_app"].annotations.idempotent_hint is True
     assert t["set_power"].annotations.idempotent_hint is True  # WAKEUP/SLEEP, not a toggle
@@ -73,6 +81,19 @@ async def test_send_key_schema(mcp_client):
 async def test_set_power_schema(mcp_client):
     props = (await tools(mcp_client))["set_power"].input_schema["properties"]
     assert set(props["state"]["enum"]) == {"on", "off"}
+
+
+async def test_get_now_playing_takes_no_arguments(mcp_client):
+    # It runs a shell command over ADB, so nothing the model writes may reach it.
+    t = (await tools(mcp_client))["get_now_playing"]
+    assert not t.input_schema.get("properties")
+    assert set(t.output_schema["required"]) == {"state", "app_package", "app", "title", "subtitle", "position_s"}
+
+
+async def test_get_now_playing_without_adb_says_how_to_enable(mcp_client):
+    result = await mcp_client.call_tool("get_now_playing", {})
+    assert result.is_error
+    assert "mcp-server-shieldtv adb-setup" in text(result)
 
 
 async def test_get_status_publishes_output_schema(mcp_client):

@@ -31,6 +31,6 @@ async def test_serve_over_stdio(tmp_path):
     params = StdioServerParameters(command=exe, args=[], env=env)
     async with Client(params) as c:
         names = {t.name for t in (await c.list_tools()).tools}
-        assert names == {"get_status", "list_apps", "send_key", "launch_app", "set_power"}
+        assert names == {"get_status", "get_now_playing", "list_apps", "send_key", "launch_app", "set_power"}
         status = (await c.call_tool("get_status", {})).structured_content
         assert (status["paired"], status["reachable"]) == (False, False)

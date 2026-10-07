@@ -1,9 +1,10 @@
-"""Entry point: `mcp-server-shieldtv` (serve), `... pair`, `... discover`."""
+"""Entry point: `mcp-server-shieldtv` (serve), `... pair`, `... discover`, `... adb-setup`."""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import dataclasses
 import logging
 import os
 import sys
@@ -22,6 +23,7 @@ from .config import (
     ensure_private_dir,
     load_settings,
     lock_down_credentials,
+    save_config,
     save_host,
 )
 from .discovery import discover
@@ -137,6 +139,45 @@ async def _cmd_pair(host_arg: str | None) -> int:
     return 0
 
 
+async def _cmd_adb_setup() -> int:
+    """Enable the optional, read-only ADB features (get_now_playing).
+
+    1. Generate an ADB key pair (if missing), private to this config dir.
+    2. Connect with it. An untrusted key makes the Shield ask "Allow USB
+       debugging?" on the TV, so wait long enough for someone to answer.
+    3. Run the one fixed command once to prove it works, then save "adb": true.
+    """
+    # Imported here so `pair` and `discover` don't need adb-shell loaded.
+    from .adb import ensure_adb_key, now_playing, run_now_playing_command
+    from .client import ShieldError
+
+    settings = load_settings()
+    if not settings.host:
+        print("No Shield address yet. Run `mcp-server-shieldtv pair` first.", file=sys.stderr)
+        return 1
+    ensure_private_dir()
+    if ensure_adb_key(settings):
+        print(f"Generated an ADB key in {config_dir()}")
+    lock_down_credentials(settings)
+    print(
+        f'Connecting to {settings.host}:5555. If the TV asks "Allow USB debugging?", tick '
+        '"Always allow from this computer" and choose Allow (waiting up to 60s).'
+    )
+    try:
+        text = await run_now_playing_command(dataclasses.replace(settings, adb=True), auth_timeout_s=60.0)
+    except ShieldError as exc:
+        print(
+            f"{exc}\nNetwork debugging must be on: Settings > Device Preferences > About, select Build "
+            "seven times, then Developer options > Network debugging.",
+            file=sys.stderr,
+        )
+        return 1
+    save_config(adb=True)
+    playing = now_playing(text, settings.app_name_for)
+    print(f'ADB works. Now playing: {playing["title"] or "nothing"} ({playing["state"]}). Saved "adb": true.')
+    return 0
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="mcp-server-shieldtv", description=__doc__)
     sub = parser.add_subparsers(dest="cmd")
@@ -145,6 +186,7 @@ def main() -> None:
     p_pair.add_argument("--host", help="Shield IP address (skips mDNS discovery)")
     p_disc = sub.add_parser("discover", help="list Android TV devices on the LAN")
     p_disc.add_argument("--timeout", type=float, default=5.0)
+    sub.add_parser("adb-setup", help="enable the optional read-only ADB tools (get_now_playing)")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     args = parser.parse_args()
 
@@ -152,6 +194,8 @@ def main() -> None:
         sys.exit(asyncio.run(_cmd_pair(args.host)))
     if args.cmd == "discover":
         sys.exit(asyncio.run(_cmd_discover(args.timeout)))
+    if args.cmd == "adb-setup":
+        sys.exit(asyncio.run(_cmd_adb_setup()))
 
     _setup_logging()
     from .server import mcp  # imported late: `pair` and `discover` don't need the server code
