@@ -21,6 +21,7 @@ dependencies = [
     "mcp>=2.3,<3",
     "androidtvremote2>=0.3.2",
     "zeroconf>=0.130",
+    "typing_extensions>=4.7",
 ]
 
 [project.urls]

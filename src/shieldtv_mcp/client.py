@@ -17,7 +17,7 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import Callable
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal
 
 from androidtvremote2 import (
     AndroidTVRemote,
@@ -27,6 +27,7 @@ from androidtvremote2 import (
     VolumeInfo,
 )
 from mcp.server.mcpserver.exceptions import ToolError
+from typing_extensions import TypedDict
 
 from .config import ALLOWED_KEYS, CLIENT_NAME, Settings
 
@@ -45,6 +46,8 @@ class ShieldError(ToolError):
 # --- get_status's shape -----------------------------------------------------
 # Returning TypedDicts (rather than dict[str, Any]) makes the MCP SDK publish an
 # outputSchema for get_status, so clients know the fields without guessing.
+# They come from typing_extensions: on Python 3.11, Pydantic rejects
+# typing.TypedDict, and the SDK then silently drops the schema.
 class Volume(TypedDict):
     level: int
     max: int
