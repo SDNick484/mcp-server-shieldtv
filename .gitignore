@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtualenvs
+.venv/
+venv/
+
+# Test / tooling caches
+.pytest_cache/
+.ruff_cache/
+
+# Pairing credentials. The cert/key pair controls your Shield; never commit it.
+cert.pem
+key.pem
+config.json

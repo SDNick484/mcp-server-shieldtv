@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mcp-server-shieldtv"
+version = "0.1.0"
+description = "MCP server for NVIDIA Shield TV (Android TV Remote protocol v2) with a one-time pairing CLI"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Nicholas E. Andrade" }]
+requires-python = ">=3.11"
+keywords = ["mcp", "mcp-server", "nvidia-shield", "shield-tv", "android-tv", "home-automation"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Home Automation",
+]
+dependencies = [
+    "mcp>=2.3,<3",
+    "androidtvremote2>=0.3.2",
+    "zeroconf>=0.130",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+mcp-server-shieldtv = "shieldtv_mcp.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
