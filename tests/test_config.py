@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import stat
 from typing import get_args
+from urllib.parse import urlparse
 
 import pytest
 from androidtvremote2.remotemessage_pb2 import RemoteKeyCode
@@ -44,7 +45,7 @@ def test_speaker_mute_is_volume_mute():
 def test_default_apps_launch_by_link():
     # A bare package becomes market://launch?id=..., which the Shield rejects.
     for app in DEFAULT_APPS.values():
-        assert app.target.startswith("https://") and app.package
+        assert urlparse(app.target).scheme not in ("", "market") and app.package
 
 
 def test_user_apps_merge_and_reverse_lookup(settings):

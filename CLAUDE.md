@@ -48,6 +48,10 @@ Hardware facts the code depends on (the library hides them):
   make later ones look like they succeeded. Never trust a send as proof; `launch` checks the
   foreground app.
 - A link no installed app handles is accepted; the foreground app just doesn't change.
+  Custom schemes (`plex://`, `spotify:`) are accepted too; prefer them where the https link
+  also matches the browser stub. Find handlers with `adb shell cmd package query-activities`
+  (see README). An app's first launch after install can take over 10s, so a one-off launch
+  timeout right after installing isn't proof the link is wrong.
 - Volume behind HDMI-CEC arrives with `max == 0`; it is reported as `None`. In standby the
   Shield reports its own volume (e.g. 1/15) instead.
 

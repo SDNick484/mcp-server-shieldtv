@@ -56,9 +56,10 @@ ALLOWED_KEYS: frozenset[str] = frozenset(get_args(KeyName))
 class App:
     """What launch_app sends, and how to recognize the app once it is open.
 
-    target  - an https deep link, or a bare package name. The library turns a
-              bare package into ``market://launch?id=<package>``, which the
-              Shield (remote service 7.x) rejects, so links are the default.
+    target  - a deep link (https, or an app's own scheme such as ``spotify:``),
+              or a bare package name. The library turns a bare package into
+              ``market://launch?id=<package>``, which the Shield (remote
+              service 7.x) rejects, so links are the default.
     package - the Android package that should reach the foreground. Used to
               confirm a launch worked and to name the app in get_status.
               None means "unknown": any change of foreground app counts.
@@ -70,11 +71,18 @@ class App:
 
 # Friendly name -> app. Extend per-user through the "apps" object in
 # config.json; user entries win over these defaults. Each of these was
-# checked on a real Shield (2026-10): the link opened that package.
+# checked on a real Shield (2026-10): the link opened that package. Plex and
+# Spotify use their own schemes: only the app handles those, while the https
+# links also match the browser stub (open.spotify.com matches only the stub).
 DEFAULT_APPS: dict[str, App] = {
     "youtube": App("https://www.youtube.com", "com.google.android.youtube.tv"),
+    "youtube-tv": App("https://tv.youtube.com", "com.google.android.youtube.tvunplugged"),
     "netflix": App("https://www.netflix.com/title", "com.netflix.ninja"),
     "prime-video": App("https://app.primevideo.com", "com.amazon.amazonvideo.livingroom"),
+    "disney+": App("https://www.disneyplus.com", "com.disney.disneyplus"),
+    "hulu": App("https://www.hulu.com/welcome", "com.hulu.livingroomplus"),
+    "plex": App("plex://", "com.plexapp.android"),
+    "spotify": App("spotify:", "com.spotify.tv.android"),
 }
 
 

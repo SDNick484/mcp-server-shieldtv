@@ -119,9 +119,11 @@ Allowed keys: `HOME`, `BACK`, `MENU`, `DPAD_UP`/`DOWN`/`LEFT`/`RIGHT`/`CENTER`,
 
 ### Apps
 
-Default apps, each checked on a real Shield: `youtube`, `netflix`, `prime-video`.
+Default apps, each checked on a real Shield: `youtube`, `youtube-tv`, `netflix`,
+`prime-video`, `disney+`, `hulu`, `plex`, `spotify`.
 
-Apps launch through **https deep links**. On the Shield (remote service 7.x), a bare
+Apps launch through **deep links**: https links, or an app's own scheme (`plex://`,
+`spotify:`) where the https link would go to a browser instead. On the Shield (remote service 7.x), a bare
 package name is sent as `market://launch?id=<package>`, which the Shield rejects and then
 drops the connection. `launch_app` waits for the app to reach the foreground (up to 10s)
 and returns an error that says what happened if it doesn't: the request was rejected, or it
@@ -148,9 +150,19 @@ Without it, any app other than the home screen coming to the front counts as suc
 Names are case-insensitive, and an entry with the same name as a default replaces it.
 Restart the server (or your MCP client) to pick up changes.
 
-**Finding the link and package:** try the service's website address (`https://www.<service>.com`)
-as the link. Open the app on the Shield, then call `get_status` (or ask "what app is open on
-the Shield?"); `current_app_package` is the package.
+**Finding the link and package:** open the app on the Shield, then call `get_status` (or ask
+"what app is open on the Shield?"); `current_app_package` is the package. For the link, try
+the service's website address (`https://www.<service>.com`). With ADB enabled, Android can
+tell you which app a link opens without launching anything:
+
+```sh
+adb shell cmd package query-activities --brief -a android.intent.action.VIEW \
+  -c android.intent.category.BROWSABLE -d 'https://tv.youtube.com'
+```
+
+A result of `com.google.android.tv.frameworkpackagestubs/.Stubs$BrowserStub` means "no app"
+(the TV shows "You don't have an app that can do this"). If the stub is listed alongside the
+app, the app usually still opens, but its own scheme (if it has one) avoids the ambiguity.
 
 ## Safety design
 
@@ -233,8 +245,6 @@ To poke at the tools interactively: `npx @modelcontextprotocol/inspector mcp-ser
 
 ## Roadmap
 
-- Find working links for more apps (Plex, Disney+, Hulu, Spotify, Kodi were dropped from the
-  defaults until checked on a Shield that has them installed)
 - Optional ADB-backed read-only tools (now playing), kept separate and typed
 - Publish to PyPI and the MCP registry
 
