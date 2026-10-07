@@ -14,16 +14,18 @@ over for later drops.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
-from typing import Any
+from collections.abc import Callable
+from typing import Any, Literal, TypedDict
 
 from androidtvremote2 import (
     AndroidTVRemote,
     CannotConnect,
     ConnectionClosed,
     InvalidAuth,
+    VolumeInfo,
 )
-
 from mcp.server.mcpserver.exceptions import ToolError
 
 from .config import ALLOWED_KEYS, CLIENT_NAME, Settings
@@ -40,16 +42,60 @@ class ShieldError(ToolError):
     """
 
 
+# --- get_status's shape -----------------------------------------------------
+# Returning TypedDicts (rather than dict[str, Any]) makes the MCP SDK publish an
+# outputSchema for get_status, so clients know the fields without guessing.
+class Volume(TypedDict):
+    level: int
+    max: int
+    muted: bool
+
+
+class Device(TypedDict):
+    manufacturer: str
+    model: str
+    sw_version: str
+
+
+class Status(TypedDict):
+    host: str | None
+    paired: bool
+    reachable: bool
+    power: Literal["on", "standby"] | None
+    current_app_package: str | None
+    current_app: str | None
+    volume: Volume | None
+    device: Device | None
+
+
+# Anything that builds a remote from (client_name, certfile, keyfile, host).
+# Normally AndroidTVRemote itself; tests pass a fake.
+RemoteFactory = Callable[[str, str, str, str], Any]
+
+
 class ShieldClient:
-    def __init__(self, settings: Settings) -> None:
+    """Owns the connection to one Shield and the latest state it pushed.
+
+    State fields (written by the library's callbacks, read by tools):
+      available   - connected right now. Goes False while the library reconnects.
+      auth_failed - the Shield rejected our certificate. Retrying won't help;
+                    only re-pairing will, so it is tracked apart from available.
+      is_on, current_app, volume - last pushed values; None until first known.
+
+    Everything runs on the server's single asyncio event loop, so the callbacks
+    and tools never run at the same time and need no locks.
+    """
+
+    def __init__(self, settings: Settings, remote_factory: RemoteFactory = AndroidTVRemote) -> None:
         self.settings = settings
+        self._remote_factory = remote_factory
         self._remote: AndroidTVRemote | None = None
         self._task: asyncio.Task[None] | None = None
         self.available = False
         self.auth_failed = False
         self.is_on: bool | None = None
         self.current_app: str | None = None
-        self.volume: Any = None
+        self.volume: VolumeInfo | None = None
 
     # --- lifecycle ---------------------------------------------------------
     async def start(self) -> None:
@@ -61,17 +107,26 @@ class ShieldClient:
     async def stop(self) -> None:
         if self._task:
             self._task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await self._task
-            except asyncio.CancelledError:
-                pass
         if self._remote:
             self._remote.disconnect()
         self.available = False
 
     async def _connect_forever(self) -> None:
+        # Nothing awaits this task until shutdown, so an unexpected exception
+        # would vanish silently. Log it instead.
+        try:
+            await self._connect_and_watch()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Shield connection task crashed")
+
+    async def _connect_and_watch(self) -> None:
         s = self.settings
-        remote = AndroidTVRemote(CLIENT_NAME, str(s.cert_path), str(s.key_path), s.host)
+        assert s.host is not None  # start() only runs this when paired
+        remote = self._remote_factory(CLIENT_NAME, str(s.cert_path), str(s.key_path), s.host)
         remote.add_is_on_updated_callback(self._set_is_on)
         remote.add_current_app_updated_callback(self._set_current_app)
         remote.add_volume_info_updated_callback(self._set_volume)
@@ -86,7 +141,7 @@ class ShieldClient:
                 self.auth_failed = True
                 log.error("Shield rejected our certificate; re-run `mcp-server-shieldtv pair`.")
                 return
-            except (CannotConnect, ConnectionClosed, OSError, asyncio.TimeoutError) as exc:
+            except (TimeoutError, CannotConnect, ConnectionClosed, OSError) as exc:
                 log.info("Shield unreachable (%s); retrying in %.0fs", exc, delay)
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 60.0)
@@ -100,13 +155,13 @@ class ShieldClient:
         log.info("Connected to Shield at %s", s.host)
 
     # --- state callbacks (called by the library) ----------------------------
-    def _set_is_on(self, value: bool) -> None:
+    def _set_is_on(self, value: bool | None) -> None:
         self.is_on = value
 
-    def _set_current_app(self, value: str) -> None:
+    def _set_current_app(self, value: str | None) -> None:
         self.current_app = value
 
-    def _set_volume(self, value: Any) -> None:
+    def _set_volume(self, value: VolumeInfo | None) -> None:
         self.volume = value
 
     def _set_available(self, value: bool) -> None:
@@ -144,17 +199,22 @@ class ShieldClient:
     def launch(self, target: str) -> None:
         self._run(lambda r: r.send_launch_app_command(target))
 
-    def _run(self, fn) -> None:
+    def _run(self, fn: Callable[[AndroidTVRemote], None]) -> None:
         remote = self._require()
+        # _require() passing isn't a guarantee: the connection can drop before
+        # the library reports it via the is_available callback, and the send
+        # then raises ConnectionClosed. Turn that into advice the model sees.
         try:
             fn(remote)
         except ConnectionClosed as exc:
             raise ShieldError("The connection to the Shield dropped; try again in a moment.") from exc
 
     # --- reporting ---------------------------------------------------------
-    def snapshot(self) -> dict[str, Any]:
+    def snapshot(self) -> Status:
+        # The library hands volume and device info over as plain dicts
+        # (TypedDicts), not objects: index them, don't use attributes.
         vol = self.volume
-        info = getattr(self._remote, "device_info", None) if self._remote else None
+        info = self._remote.device_info if self._remote else None
         return {
             "host": self.settings.host,
             "paired": self.settings.paired,
@@ -162,11 +222,13 @@ class ShieldClient:
             "power": None if self.is_on is None else ("on" if self.is_on else "standby"),
             "current_app_package": self.current_app or None,
             "current_app": self.settings.app_name_for(self.current_app),
-            "volume": (
-                {"level": vol.level, "max": vol.max, "muted": vol.muted} if vol is not None else None
-            ),
+            "volume": ({"level": vol["level"], "max": vol["max"], "muted": vol["muted"]} if vol else None),
             "device": (
-                {"manufacturer": info["manufacturer"], "model": info["model"], "sw_version": info["sw_version"]}
+                {
+                    "manufacturer": info.get("manufacturer", ""),
+                    "model": info.get("model", ""),
+                    "sw_version": info.get("sw_version", ""),
+                }
                 if info
                 else None
             ),

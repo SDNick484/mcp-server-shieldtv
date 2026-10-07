@@ -71,12 +71,17 @@ For Claude Code: `claude mcp add shieldtv -- /path/to/.venv/bin/mcp-server-shiel
 |---|---|
 | `get_status` | Reachability, power (`on`/`standby`), foreground app, volume, device info |
 | `list_apps` | The app names `launch_app` accepts |
-| `send_key` | Press an allow-listed remote key, optionally repeated 1-10 times |
+| `send_key` | Press an allow-listed remote key, optionally repeated 1-10 times (see below) |
 | `launch_app` | Launch an allow-listed app by friendly name |
 | `set_power` | Wake (`on`) or sleep (`off`) using `WAKEUP`/`SLEEP`, not the `POWER` toggle |
 
 This protocol reports the foreground *app* but not what is playing (title, artist,
-position).
+position). `get_status` returns structured content with a published output schema.
+
+Allowed keys: `HOME`, `BACK`, `MENU`, `DPAD_UP`/`DOWN`/`LEFT`/`RIGHT`/`CENTER`,
+`MEDIA_PLAY_PAUSE`, `MEDIA_PLAY`, `MEDIA_PAUSE`, `MEDIA_STOP`, `MEDIA_NEXT`,
+`MEDIA_PREVIOUS`, `MEDIA_REWIND`, `MEDIA_FAST_FORWARD`, `VOLUME_UP`, `VOLUME_DOWN`,
+`VOLUME_MUTE`.
 
 ### Add your own apps
 
@@ -89,14 +94,15 @@ Edit `~/.config/mcp-server-shieldtv/config.json`:
 ## Safety design
 
 - **Keys are an allow-list.** The tool schema is an enum, and the client re-checks it.
-  `POWER`, `SEARCH` (starts voice capture), `SETTINGS`, and raw numeric key codes are not
-  available.
+  `POWER`, `SEARCH` (starts voice capture), `SETTINGS`, `MUTE` (Android's *microphone*
+  mute), raw numeric key codes, and the library's `text:` typing are not available.
 - **Apps are an allow-list.** Only names in `list_apps` can be launched.
 - **No shell, no ADB, no arbitrary key codes**, so a prompt-injected model has a small blast
   radius.
 - **Credentials are private** (`0600`) and never logged. Logs go to stderr because stdout
   belongs to the MCP transport.
-- Tools carry MCP annotations (`readOnlyHint`, `idempotentHint`, ...).
+- Tools carry titles and MCP annotations (`readOnlyHint`, `destructiveHint`,
+  `idempotentHint`, `openWorldHint`) so clients can decide what needs confirmation.
 
 ## Behavior notes
 
@@ -110,8 +116,18 @@ Edit `~/.config/mcp-server-shieldtv/config.json`:
 
 ```sh
 pip install -e ".[dev]"
-pytest
+pytest              # unit + in-process MCP + stdio end-to-end tests, no Shield needed
+ruff check . && ruff format --check .
+mypy                # strict type checking of src/
 ```
+
+Tests are layered: `test_config.py` (allow-lists, checked against the protocol's own key
+enum), `test_client.py` (connection lifecycle against a fake remote), `test_tools.py`
+(the MCP contract through an in-process client: schemas, annotations, results, errors),
+and `test_stdio.py` (the installed entry point over stdio). CI runs all of it on
+Python 3.11-3.14.
+
+To poke at the tools interactively: `npx @modelcontextprotocol/inspector mcp-server-shieldtv`.
 
 ## Roadmap
 

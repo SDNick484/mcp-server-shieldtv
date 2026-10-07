@@ -14,14 +14,16 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, get_args
+from typing import Any, Literal, get_args
 
 CLIENT_NAME = "mcp-server-shieldtv"
 
 # --- Allow-lists -----------------------------------------------------------
-# The model can only press keys named here. Deliberately absent: POWER (a
-# toggle with ambiguous state), SEARCH (starts a voice session), SETTINGS,
-# and the raw numeric key-code escape hatch the underlying library offers.
+# The model can only press keys named here. Each name is a RemoteKeyCode from
+# the protocol with the "KEYCODE_" prefix dropped (tests check they all exist).
+# Deliberately absent: POWER (a toggle with ambiguous state), SEARCH (starts a
+# voice session), SETTINGS, MUTE (Android's *microphone* mute; speaker mute is
+# VOLUME_MUTE), plus the library's raw numeric codes and "text:" typing.
 KeyName = Literal[
     "HOME",
     "BACK",
@@ -41,12 +43,14 @@ KeyName = Literal[
     "MEDIA_FAST_FORWARD",
     "VOLUME_UP",
     "VOLUME_DOWN",
-    "MUTE",
+    "VOLUME_MUTE",
 ]
 ALLOWED_KEYS: frozenset[str] = frozenset(get_args(KeyName))
 
 # Friendly name -> package name (or deep link). Extend per-user through the
 # "apps" object in config.json; user entries win over these defaults.
+# Unverified: these are the usual Android TV package names, not yet checked
+# on a real Shield.
 DEFAULT_APPS: dict[str, str] = {
     "netflix": "com.netflix.ninja",
     "youtube": "com.google.android.youtube.tv",
@@ -77,6 +81,8 @@ class Settings:
 
     @property
     def paired(self) -> bool:
+        """Host and credential files exist. Says nothing about whether the
+        Shield still accepts them; ShieldClient.auth_failed tracks that."""
         return bool(self.host) and self.cert_path.is_file() and self.key_path.is_file()
 
     def resolve_app(self, name: str) -> str | None:
@@ -92,17 +98,19 @@ class Settings:
         return None
 
 
-def _read_json(path: Path) -> dict:
+def _read_json(path: Path) -> dict[str, Any]:
     try:
-        return json.loads(path.read_text())
+        data = json.loads(path.read_text())
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
+    return data if isinstance(data, dict) else {}
 
 
 def load_settings(host_override: str | None = None) -> Settings:
     d = config_dir()
     data = _read_json(d / "config.json")
     apps = {**DEFAULT_APPS, **{k.lower(): v for k, v in data.get("apps", {}).items()}}
+    # Most specific wins: `pair --host`, then the environment, then config.json.
     host = host_override or os.environ.get("SHIELDTV_HOST") or data.get("host")
     return Settings(host=host, cert_path=d / "cert.pem", key_path=d / "key.pem", apps=apps)
 

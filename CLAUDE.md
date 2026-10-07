@@ -16,7 +16,9 @@ explain the reasoning behind non-obvious changes instead of only making them.
 - `src/shieldtv_mcp/server.py`: MCP tools (`MCPServer` from `mcp` 2.x)
 - `src/shieldtv_mcp/cli.py`: `serve` (default), `pair`, `discover`
 - `src/shieldtv_mcp/discovery.py`: mDNS lookup for `_androidtvremote2._tcp`
-- `tests/`: unit tests against a fake remote (no hardware needed)
+- `tests/`: `conftest.py` (`FakeRemote`, which mirrors the library's real data shapes),
+  `test_config`, `test_client`, `test_tools` (in-process MCP `Client`), `test_stdio`
+  (installed entry point). Async tests use anyio's plugin, not pytest-asyncio.
 
 ## Rules for changes
 
@@ -27,7 +29,11 @@ explain the reasoning behind non-obvious changes instead of only making them.
 - Log to **stderr only**. stdout is the MCP stdio transport.
 - Credentials (`cert.pem`, `key.pem`) stay `0600`, are never logged, and are never committed.
 - `send_key_command` and `send_launch_app_command` in `androidtvremote2` are synchronous;
-  `async_*` methods are the awaitable ones.
+  `async_*` methods are the awaitable ones. `volume_info` and `device_info` are dicts
+  (TypedDicts), not objects. Key names are `RemoteKeyCode` minus `KEYCODE_`; `MUTE` is the
+  microphone, `VOLUME_MUTE` the sound.
+- Every tool has a `title`, explicit `ToolAnnotations`, and constrained args via
+  `Literal`/`Annotated[..., Field(...)]`. `test_tools.py` enforces this.
 
 ## Status
 
@@ -38,6 +44,6 @@ Default app package names are best guesses until checked.
 ## Commands
 
 ```sh
-pip install -e ".[dev]" && pytest
+pip install -e ".[dev]" && pytest && ruff check . && ruff format --check . && mypy
 mcp-server-shieldtv discover | pair [--host IP] | (serve)
 ```

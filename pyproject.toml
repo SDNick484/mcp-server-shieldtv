@@ -12,6 +12,7 @@ authors = [{ name = "Nicholas E. Andrade" }]
 requires-python = ">=3.11"
 keywords = ["mcp", "mcp-server", "nvidia-shield", "shield-tv", "android-tv", "home-automation"]
 classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Topic :: Home Automation",
@@ -22,8 +23,12 @@ dependencies = [
     "zeroconf>=0.130",
 ]
 
+[project.urls]
+Homepage = "https://github.com/SDNick484/mcp-server-shieldtv"
+Issues = "https://github.com/SDNick484/mcp-server-shieldtv/issues"
+
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "anyio>=4", "ruff>=0.6", "mypy>=1.11"]
 
 [project.scripts]
 mcp-server-shieldtv = "shieldtv_mcp.cli:main"
@@ -33,3 +38,15 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+# pycodestyle, pyflakes, isort, pyupgrade, bugbear, simplify
+select = ["E", "W", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+files = ["src"]
+strict = true

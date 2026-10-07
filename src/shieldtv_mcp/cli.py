@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import sys
 
 from androidtvremote2 import (
@@ -14,6 +15,7 @@ from androidtvremote2 import (
     InvalidAuth,
 )
 
+from . import __version__
 from .config import (
     CLIENT_NAME,
     config_dir,
@@ -67,6 +69,13 @@ async def _pick_host(host: str | None) -> str | None:
 
 
 async def _cmd_pair(host_arg: str | None) -> int:
+    """Pair once, so later connections are trusted without a code.
+
+    1. Generate a self-signed client certificate and key (if missing).
+    2. Start pairing: the Shield shows a code on the TV.
+    3. Send back the code the user typed. The Shield now trusts our certificate.
+    4. Connect with it once to prove it works, and save the host.
+    """
     host = await _pick_host(host_arg)
     if not host:
         return 1
@@ -74,13 +83,20 @@ async def _cmd_pair(host_arg: str | None) -> int:
     ensure_private_dir()
     settings = load_settings(host_override=host)
     remote = AndroidTVRemote(CLIENT_NAME, str(settings.cert_path), str(settings.key_path), host)
-    if await remote.async_generate_cert_if_missing():
+    # The library writes the key with the process umask (often 0644). A 077
+    # umask makes it private from the moment it exists, not just after chmod.
+    old_umask = os.umask(0o077)
+    try:
+        generated = await remote.async_generate_cert_if_missing()
+    finally:
+        os.umask(old_umask)
+    if generated:
         print(f"Generated a new client certificate in {config_dir()}")
     lock_down_credentials(settings)
 
     try:
         name, mac = await remote.async_get_name_and_mac()
-    except (CannotConnect, OSError, asyncio.TimeoutError) as exc:
+    except (TimeoutError, CannotConnect, OSError) as exc:
         print(f"Can't reach {host}: {exc}\nIs the Shield awake and on the same network?", file=sys.stderr)
         return 1
     print(f"Pairing with {name} ({mac}). A code will appear on the TV screen.")
@@ -88,6 +104,8 @@ async def _cmd_pair(host_arg: str | None) -> int:
     for attempt in range(3):
         try:
             await remote.async_start_pairing()
+            # input() blocks; running it in a thread keeps the event loop (and
+            # the open pairing connection) alive while the user types.
             code = (await asyncio.to_thread(input, "Enter the code shown on the TV: ")).strip()
             await remote.async_finish_pairing(code)
             break
@@ -102,8 +120,9 @@ async def _cmd_pair(host_arg: str | None) -> int:
     # Prove the credential works before declaring victory.
     try:
         await remote.async_connect()
-        info = remote.device_info or {}
-        print(f"Paired and connected: {info.get('manufacturer', '?')} {info.get('model', '?')}")
+        info = remote.device_info
+        model = f"{info['manufacturer']} {info['model']}" if info else "unknown device"
+        print(f"Paired and connected: {model}")
     except (CannotConnect, InvalidAuth, ConnectionClosed, OSError) as exc:
         print(f"Paired, but the verification connect failed: {exc}", file=sys.stderr)
         return 1
@@ -121,6 +140,7 @@ def main() -> None:
     p_pair.add_argument("--host", help="Shield IP address (skips mDNS discovery)")
     p_disc = sub.add_parser("discover", help="list Android TV devices on the LAN")
     p_disc.add_argument("--timeout", type=float, default=5.0)
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     args = parser.parse_args()
 
     if args.cmd == "pair":
@@ -129,6 +149,6 @@ def main() -> None:
         sys.exit(asyncio.run(_cmd_discover(args.timeout)))
 
     _setup_logging()
-    from .server import mcp  # imported late so `pair` doesn't start the MCP machinery
+    from .server import mcp  # imported late: `pair` and `discover` don't need the server code
 
     mcp.run()

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 
-from zeroconf import IPVersion, ServiceStateChange
+from zeroconf import IPVersion, ServiceStateChange, Zeroconf
 from zeroconf.asyncio import AsyncServiceBrowser, AsyncServiceInfo, AsyncZeroconf
 
 SERVICE = "_androidtvremote2._tcp.local."
@@ -14,7 +14,8 @@ async def discover(timeout: float = 5.0) -> dict[str, str]:
     """Return {device name: IPv4 address} for Android TV Remote v2 devices."""
     names: set[str] = set()
 
-    def on_change(zeroconf, service_type, name, state_change) -> None:
+    # zeroconf calls handlers with these exact keyword names.
+    def on_change(zeroconf: Zeroconf, service_type: str, name: str, state_change: ServiceStateChange) -> None:
         if state_change in (ServiceStateChange.Added, ServiceStateChange.Updated):
             names.add(name)
 
