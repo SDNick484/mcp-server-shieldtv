@@ -16,7 +16,7 @@ from androidtvremote2 import (
     InvalidAuth,
 )
 
-from . import __version__
+from . import __version__, remote
 from .config import (
     CLIENT_NAME,
     config_dir,
@@ -181,7 +181,8 @@ async def _cmd_adb_setup() -> int:
 def main() -> None:
     parser = argparse.ArgumentParser(prog="mcp-server-shieldtv", description=__doc__)
     sub = parser.add_subparsers(dest="cmd")
-    sub.add_parser("serve", help="run the MCP server over stdio (default)")
+    p_serve = sub.add_parser("serve", help="run the MCP server (stdio by default, or --http)")
+    remote.add_http_arguments(p_serve, default_port=8712, default_path="/shieldtv/mcp")
     p_pair = sub.add_parser("pair", help="one-time pairing with a Shield")
     p_pair.add_argument("--host", help="Shield IP address (skips mDNS discovery)")
     p_disc = sub.add_parser("discover", help="list Android TV devices on the LAN")
@@ -200,4 +201,12 @@ def main() -> None:
     _setup_logging()
     from .server import mcp  # imported late: `pair` and `discover` don't need the server code
 
-    mcp.run()
+    # stdio by default (the client launches us); --http runs a long-lived
+    # service for an LXC behind Cloudflare Access (see remote.py).
+    if getattr(args, "http", False):
+        try:
+            remote.serve_http(mcp, remote.http_config(args))
+        except remote.ConfigError as exc:
+            parser.exit(2, f"mcp-server-shieldtv: {exc}\n")
+    else:
+        mcp.run()

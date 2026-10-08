@@ -23,6 +23,8 @@ dependencies = [
     "zeroconf>=0.130",
     "typing_extensions>=4.7",
     "adb-shell[async]>=0.4.4",
+    "pyjwt[crypto]>=2.10",   # verifying Cloudflare Access assertions (remote.py)
+    "uvicorn>=0.31",         # the HTTP transport (remote.py)
 ]
 
 [project.urls]
@@ -30,7 +32,7 @@ Homepage = "https://github.com/SDNick484/mcp-server-shieldtv"
 Issues = "https://github.com/SDNick484/mcp-server-shieldtv/issues"
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "anyio>=4", "ruff>=0.6", "mypy>=1.11"]
+dev = ["pytest>=8", "anyio>=4", "ruff>=0.6", "mypy>=1.11", "httpx2"]
 
 [project.scripts]
 mcp-server-shieldtv = "shieldtv_mcp.cli:main"
