@@ -1,4 +1,9 @@
-"""Entry point: `mcp-server-shieldtv` (serve), `... pair`, `... discover`, `... adb-setup`."""
+"""Entry point: ``mcp-server-shieldtv [serve] | pair | discover | adb-setup``.
+
+``serve`` is the default, so ``mcp-server-shieldtv`` alone runs the MCP server
+over stdio, and ``mcp-server-shieldtv --http`` works as well as
+``mcp-server-shieldtv serve --http`` (the spelling the sibling servers accept).
+"""
 
 from __future__ import annotations
 
@@ -27,11 +32,23 @@ from .config import (
     save_host,
 )
 from .discovery import discover
+from .logsafe import setup_logging
 
 
-def _setup_logging() -> None:
-    # stdout belongs to the MCP stdio transport; logs must go to stderr.
-    logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(levelname)s %(name)s: %(message)s")
+def _setup_logging(args: argparse.Namespace) -> None:
+    """stderr only (stdout belongs to the MCP stdio transport), redacted: LAN
+    addresses and MACs are masked unless --no-redact / SHIELDTV_LOG_UNREDACTED=1;
+    keys, certificates and JWTs always are."""
+    unredacted = getattr(args, "no_redact", False) or _flag(os.environ.get("SHIELDTV_LOG_UNREDACTED"))
+    debug = getattr(args, "debug", False) or _flag(os.environ.get("SHIELDTV_DEBUG"))
+    setup_logging(logging.DEBUG if debug else logging.INFO, redacted=not unredacted)
+    if not debug:
+        # The library logs every message it sends and receives at DEBUG; keep INFO readable.
+        logging.getLogger("androidtvremote2").setLevel(logging.INFO)
+
+
+def _flag(value: str | None) -> bool:
+    return (value or "").strip().lower() in ("1", "true", "yes", "on")
 
 
 async def _cmd_discover(timeout: float) -> int:
@@ -178,18 +195,38 @@ async def _cmd_adb_setup() -> int:
     return 0
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(prog="mcp-server-shieldtv", description=__doc__)
-    sub = parser.add_subparsers(dest="cmd")
-    p_serve = sub.add_parser("serve", help="run the MCP server (stdio by default, or --http)")
-    remote.add_http_arguments(p_serve, default_port=8712, default_path="/shieldtv/mcp")
-    p_pair = sub.add_parser("pair", help="one-time pairing with a Shield")
-    p_pair.add_argument("--host", help="Shield IP address (skips mDNS discovery)")
-    p_disc = sub.add_parser("discover", help="list Android TV devices on the LAN")
-    p_disc.add_argument("--timeout", type=float, default=5.0)
-    sub.add_parser("adb-setup", help="enable the optional ADB tools (now playing, remotes, reboot)")
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="mcp-server-shieldtv", description=__doc__.split("\n\n")[0])
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-    args = parser.parse_args()
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--debug", action="store_true", help="log protocol traffic to stderr (SHIELDTV_DEBUG=1)")
+    common.add_argument(
+        "--no-redact",
+        action="store_true",
+        help="show LAN addresses and MACs in logs (SHIELDTV_LOG_UNREDACTED=1); keys and tokens stay hidden",
+    )
+    sub = parser.add_subparsers(dest="cmd")
+    p_serve = sub.add_parser("serve", parents=[common], help="run the MCP server (stdio by default, or --http)")
+    remote.add_http_arguments(p_serve, default_port=8712, default_path="/shieldtv/mcp")
+    p_pair = sub.add_parser("pair", parents=[common], help="one-time pairing with a Shield")
+    p_pair.add_argument("--host", help="Shield IP address (skips mDNS discovery)")
+    p_disc = sub.add_parser("discover", parents=[common], help="list Android TV devices on the LAN")
+    p_disc.add_argument("--timeout", type=float, default=5.0)
+    sub.add_parser("adb-setup", parents=[common], help="enable the optional ADB tools (now playing, remotes, reboot)")
+    return parser
+
+
+def normalize(argv: list[str]) -> list[str]:
+    """No subcommand means serve: `mcp-server-shieldtv --http` is `serve --http`."""
+    if not argv or (argv[0].startswith("-") and argv[0] not in ("-h", "--help", "--version")):
+        return ["serve", *argv]
+    return list(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = build_parser()
+    args = parser.parse_args(normalize(sys.argv[1:] if argv is None else argv))
+    _setup_logging(args)
 
     if args.cmd == "pair":
         sys.exit(asyncio.run(_cmd_pair(args.host)))
@@ -198,12 +235,11 @@ def main() -> None:
     if args.cmd == "adb-setup":
         sys.exit(asyncio.run(_cmd_adb_setup()))
 
-    _setup_logging()
     from .server import mcp  # imported late: `pair` and `discover` don't need the server code
 
     # stdio by default (the client launches us); --http runs a long-lived
     # service for an LXC behind Cloudflare Access (see remote.py).
-    if getattr(args, "http", False):
+    if args.http:
         try:
             remote.serve_http(mcp, remote.http_config(args))
         except remote.ConfigError as exc:

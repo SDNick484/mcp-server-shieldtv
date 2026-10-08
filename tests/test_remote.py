@@ -209,3 +209,16 @@ async def test_unexpected_host_is_rejected_even_with_a_valid_assertion():
         body = {"jsonrpc": "2.0", "id": 1, "method": "ping"}
         resp = await http.post(f"{base}/thing/mcp", json=body, headers=headers)
         assert resp.status_code in (400, 421)
+
+
+@pytest.mark.anyio
+async def test_wildcard_bind_keeps_host_checks_on():
+    # Binding to every interface with no --public-host used to switch the
+    # Host checks off, leaving a LAN server open to DNS rebinding. Now only
+    # loopback (and any --public-host) is accepted.
+    cfg = remote.HttpConfig(bind="0.0.0.0", path="/thing/mcp", access=POLICY)
+    sec = remote.transport_security(cfg)
+    assert sec.enable_dns_rebinding_protection is True
+    assert "127.0.0.1:*" in sec.allowed_hosts and not any("evil" in h for h in sec.allowed_hosts)
+    lan = remote.transport_security(remote.HttpConfig(bind="0.0.0.0", public_hosts=("192.168.1.10",)))
+    assert "192.168.1.10:*" in lan.allowed_hosts and "http://192.168.1.10:*" in lan.allowed_origins
