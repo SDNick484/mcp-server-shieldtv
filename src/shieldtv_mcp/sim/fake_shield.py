@@ -122,6 +122,7 @@ class FakeShield:
         self.sessions: list[_Session] = []
         self.connections = 0  # remote sessions opened, ever
         self._servers: list[asyncio.Server] = []
+        self._writers: set[asyncio.StreamWriter] = set()  # every open connection, pairing ones too
         self._tmp = tempfile.TemporaryDirectory(prefix="fake-shield-")
         self._cert_path, self._key_path = self._make_server_cert()
 
@@ -192,8 +193,15 @@ class FakeShield:
         return self
 
     async def stop(self) -> None:
+        """Stop listening and drop every connection, as a Shield leaving the network would.
+
+        The connections are closed by hand: since Python 3.12, Server.wait_closed()
+        waits for every connection to end, and a client in the middle of pairing
+        (waiting for someone to type the code) would never end its own."""
         for s in self._servers:
             s.close()
+        for w in list(self._writers):
+            w.close()
         for session in list(self.sessions):
             session.close()
         for s in self._servers:
@@ -236,6 +244,7 @@ class FakeShield:
 
     # --- the remote session (6466) ------------------------------------------------------
     async def _remote_conn(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        self._track(writer)
         if self.faults.refuse:
             writer.close()
             return
@@ -290,7 +299,14 @@ class FakeShield:
         # else: accepted, nothing opens (seen on the owner's Shield)
 
     # --- pairing (6467) ---------------------------------------------------------------
+    def _track(self, writer: asyncio.StreamWriter) -> None:
+        self._writers.add(writer)
+        task = asyncio.current_task()
+        if task is not None:
+            task.add_done_callback(lambda _: self._writers.discard(writer))
+
     async def _pairing_conn(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        self._track(writer)
         cert = self.client_cert()
         tls = _TlsStream(reader, writer, self._tls([cert] if cert else []))
         try:
