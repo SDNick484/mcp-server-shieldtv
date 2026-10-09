@@ -76,6 +76,7 @@ class App:
 # checked on a real Shield (2026-10): the link opened that package. Plex and
 # Spotify use their own schemes: only the app handles those, while the https
 # links also match the browser stub (open.spotify.com matches only the stub).
+# ASSUMPTION S-APP-LINKS.
 DEFAULT_APPS: dict[str, App] = {
     "youtube": App("https://www.youtube.com", "com.google.android.youtube.tv"),
     "youtube-tv": App("https://tv.youtube.com", "com.google.android.youtube.tvunplugged"),
@@ -109,6 +110,10 @@ def config_dir() -> Path:
     return Path(base) / "mcp-server-shieldtv"
 
 
+REMOTE_PORT = 6466  # the remote session (every tool call)
+PAIRING_PORT = 6467  # pairing, and reading the Shield's name and MAC
+
+
 @dataclass(frozen=True)
 class Settings:
     host: str | None
@@ -118,6 +123,16 @@ class Settings:
     # Opt-in: set by `adb-setup` once the Shield has accepted adb_key_path.
     adb: bool = False
     adb_key_path: Path | None = None
+    # Saved by `pair` from the Shield's certificate: how it is recognized if
+    # its address changes (see ShieldClient.rediscover).
+    name: str | None = None
+    mac: str | None = None
+    # Real Shields use 6466/6467; other values are for the simulator.
+    port: int = REMOTE_PORT
+    pairing_port: int = PAIRING_PORT
+    dry_run: bool = False
+    # Anything wrong with config.json, in words (logged at startup, shown by doctor).
+    problems: tuple[str, ...] = ()
 
     @property
     def paired(self) -> bool:
@@ -138,28 +153,65 @@ class Settings:
         return None
 
 
-def _read_json(path: Path) -> dict[str, Any]:
+def _read_json(path: Path, problems: list[str] | None = None) -> dict[str, Any]:
+    """config.json as a dict. A missing file is normal; a broken one is a
+    problem worth saying out loud (silently ignoring it looks like "not
+    paired", which sends people to re-pair for nothing)."""
     try:
         data = json.loads(path.read_text())
-    except (FileNotFoundError, json.JSONDecodeError):
+    except FileNotFoundError:
         return {}
-    return data if isinstance(data, dict) else {}
+    except json.JSONDecodeError as exc:
+        if problems is not None:
+            problems.append(f"{path} is not valid JSON (line {exc.lineno}: {exc.msg}); ignoring it")
+        return {}
+    except OSError as exc:
+        if problems is not None:
+            problems.append(f"can't read {path} ({exc})")
+        return {}
+    if not isinstance(data, dict):
+        if problems is not None:
+            problems.append(f"{path} should hold a JSON object; ignoring it")
+        return {}
+    return data
+
+
+def _port(value: Any, what: str, default: int, problems: list[str]) -> int:
+    if value is None:
+        return default
+    if isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= 65535:
+        return value
+    problems.append(f"ignoring {what}={value!r}: must be a port number")
+    return default
+
+
+def _flag(value: str | None) -> bool:
+    return (value or "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def load_settings(host_override: str | None = None) -> Settings:
+    """Never raises: anything wrong becomes a sentence in Settings.problems."""
     d = config_dir()
-    data = _read_json(d / "config.json")
+    problems: list[str] = []
+    data = _read_json(d / "config.json", problems)
     user_apps = data.get("apps", {})
     apps = dict(DEFAULT_APPS)
     if isinstance(user_apps, dict):
         for name, value in user_apps.items():
             app = _parse_app(value)
             if app is None:
-                log.warning("Ignoring app %r in config.json: expected a string or {link, package}", name)
+                problems.append(f"ignoring app {name!r} in config.json: expected a string or {{link, package}}")
             else:
                 apps[name.lower()] = app
+    else:
+        problems.append('"apps" in config.json should be an object; ignoring it')
     # Most specific wins: `pair --host`, then the environment, then config.json.
     host = host_override or os.environ.get("SHIELDTV_HOST") or data.get("host")
+    if host is not None and not isinstance(host, str):
+        problems.append(f"ignoring host {host!r} in config.json: expected a string")
+        host = None
+    port = _port(data.get("port"), "port", REMOTE_PORT, problems)
+    pairing_port = _port(data.get("pairing_port"), "pairing_port", PAIRING_PORT, problems)
     return Settings(
         host=host,
         cert_path=d / "cert.pem",
@@ -167,6 +219,12 @@ def load_settings(host_override: str | None = None) -> Settings:
         apps=apps,
         adb=data.get("adb") is True,
         adb_key_path=d / "adbkey",
+        name=data.get("name") if isinstance(data.get("name"), str) else None,
+        mac=data.get("mac") if isinstance(data.get("mac"), str) else None,
+        port=port,
+        pairing_port=pairing_port,
+        dry_run=_flag(os.environ.get("SHIELDTV_DRY_RUN")),
+        problems=tuple(problems),
     )
 
 

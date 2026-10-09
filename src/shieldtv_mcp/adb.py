@@ -52,6 +52,7 @@ NOW_PLAYING_COMMAND = "dumpsys media_session; echo __UPTIME__; cat /proc/uptime"
 REMOTES_COMMAND = "dumpsys bluetooth_manager; echo __INPUT__; dumpsys input"
 BOOT_COMMAND = "getprop sys.boot_completed"  # "1" once Android has finished booting
 COMMANDS = frozenset({NOW_PLAYING_COMMAND, REMOTES_COMMAND, BOOT_COMMAND})
+REBOOT = "adb reboot"  # how a reboot is listed in results' `sent` (the ADB reboot service, not a shell)
 
 # android.media.session.PlaybackState constants.
 PlayState = Literal["playing", "paused", "buffering", "stopped", "other", "idle"]
@@ -68,7 +69,7 @@ _ADVANCING = {3, 4, 5}  # states where the position moves on its own
 
 # Live TV reports a stream offset (13 hours on YouTube TV), not a position in
 # a show, so no position is reported for these, or for anything longer than
-# any movie.
+# any movie. ASSUMPTION S-LIVE-TV-PACKAGES.
 LIVE_TV_PACKAGES = frozenset({"com.google.android.youtube.tvunplugged", "com.sling"})
 MAX_POSITION_S = 6 * 3600
 
@@ -104,7 +105,8 @@ def _null(value: str) -> str | None:
 
 
 def parse_sessions(text: str) -> list[Session]:
-    """The "Sessions Stack" entries, in the order dumpsys lists them (priority)."""
+    """The "Sessions Stack" entries, in the order dumpsys lists them (priority).
+    ASSUMPTION S-DUMPSYS-MEDIA."""
     sessions: list[Session] = []
     in_stack = False
     for line in text.splitlines():
@@ -183,7 +185,7 @@ def now_playing(text: str, app_name_for: Callable[[str | None], str | None]) -> 
 # --- Bluetooth remotes ----------------------------------------------------------
 # Seen on a real Shield after a reboot: Bluetooth reports a remote (Harmony hub,
 # Shield remote) as HID-connected, but Android never creates its input device,
-# so its buttons do nothing. A working remote's input device has bus 0x0005
+# so its buttons do nothing. ASSUMPTION S-STUCK-REMOTES. A working remote's input device has bus 0x0005
 # (Bluetooth) and its address as UniqueId, so the two views can be matched.
 RemoteState = Literal["working", "stuck", "connecting", "disconnected"]
 _HID_STATES: dict[int, RemoteState] = {0: "disconnected", 1: "connecting", 2: "working", 3: "disconnected"}
@@ -208,7 +210,11 @@ class RemotesReport(TypedDict):
 
 
 class RebootResult(TypedDict):
-    back_after_s: float
+    # The fields every action shares (ActionResult in server.py), then the reboot's own
+    outcome: Literal["done", "dry_run"]
+    detail: str
+    sent: list[str]
+    back_after_s: float | None
     remotes: list[Remote]
     advice: str | None
 
@@ -397,7 +403,7 @@ async def read_remotes(settings: Settings, device_factory: DeviceFactory = AdbDe
 # Reboot timing, measured on a real Shield: ADB and the remote service were
 # back ~38s after the reboot command, and the remotes were stuck within a
 # minute. Module-level so tests can shorten them.
-BOOT_TIMEOUT_S = 180.0
+BOOT_TIMEOUT_S = 180.0  # a real Shield was back in 33-38 s (ASSUMPTION S-REBOOT-TIME)
 POLL_S = 3.0
 # Remotes that reconnect on their own (a Shield remote) may connect, and get
 # stuck, a little after boot. A Harmony hub doesn't: on a real Shield it stayed
@@ -448,4 +454,25 @@ async def reboot_and_check(
     await sleep(REMOTES_SETTLE_S)
     remotes = parse_remotes(await run_command(settings, REMOTES_COMMAND, device_factory=device_factory))
     missing = [r for r in remotes if r["address"] in expected and r["state"] in ("disconnected", "connecting")]
-    return {"back_after_s": round(booted_at - start, 1), **remotes_report(remotes, missing)}
+    back = round(booted_at - start, 1)
+    return {
+        "outcome": "done",
+        "detail": f"Rebooted; the Shield was back after {back:.0f}s",
+        "sent": [REBOOT],
+        "back_after_s": back,
+        **remotes_report(remotes, missing),
+    }
+
+
+def reboot_dry_run(settings: Settings) -> RebootResult:
+    """What reboot_and_check would do, without connecting. Still checks that
+    ADB is set up, so a dry run fails where the real call would."""
+    _signer_and_host(settings)
+    return {
+        "outcome": "dry_run",
+        "detail": "DRY RUN, nothing sent: would reboot the Shield over ADB and check the remotes afterwards",
+        "sent": [REBOOT],
+        "back_after_s": None,
+        "remotes": [],
+        "advice": None,
+    }

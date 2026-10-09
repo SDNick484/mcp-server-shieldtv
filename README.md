@@ -7,9 +7,19 @@ Android TV Remote protocol v2 (the same protocol the Google TV phone app uses). 
 MCP client such as Claude press remote keys, launch apps, wake or sleep the Shield, and
 read its power state and foreground app.
 
-> **Status: early / untested on hardware.** The code is covered by unit tests against a fake
-> remote and the MCP tool surface is smoke-tested over stdio, but it has not yet been run
-> against a real Shield. Expect rough edges, and please open issues.
+> **Status.** Pairing, `get_status`, keys, `launch_app`, `set_power` and the ADB tools were
+> verified on a real Shield (remote service 7.00) in 2026-10. The features added since
+> (pairing retries, reconnect and rediscovery hardening, dry run, `doctor`, resources and
+> prompts, HTTP, the Alpine service) are **verified against the simulator only**, a
+> wire-level fake that the real protocol library pairs and connects with.
+> [Verification status](#verification-status) lists every protocol assumption and whether a
+> Shield has confirmed it; [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md) is the checklist.
+
+It's one of four sibling servers with the same conventions (dry run, `doctor`, typed results,
+Streamable HTTP behind Cloudflare Access):
+[mcp-server-onkyo](https://github.com/SDNick484/mcp-server-onkyo),
+[mcp-server-harmony](https://github.com/SDNick484/mcp-server-harmony) and
+[mcp-server-sofabaton](https://github.com/SDNick484/mcp-server-sofabaton).
 
 This is not an official NVIDIA project, and NVIDIA publishes no MCP server for the Shield.
 
@@ -57,9 +67,31 @@ mcp-server-shieldtv discover            # optional: list Android TV devices via 
 mcp-server-shieldtv pair                # finds the Shield, or: pair --host 192.168.1.50
 ```
 
-A code appears on the TV; type it into the terminal. Pairing generates a client
-certificate and key under `~/.config/mcp-server-shieldtv/` (override with
-`SHIELDTV_CONFIG_DIR`) and saves the Shield's address in `config.json`.
+A code appears on the TV; type it into the terminal. A typo, a rejected code or Cancel on
+the TV starts over with a new code (three tries). Pairing generates a client certificate
+and key under `~/.config/mcp-server-shieldtv/` (override with `SHIELDTV_CONFIG_DIR`) and
+saves the Shield's address, name and MAC in `config.json`. The MAC is how the server finds
+the Shield again if its address changes. Unusable old credentials are set aside
+(`cert.pem.broken`) and replaced. A running server notices a new pairing and reconnects
+with it; it doesn't need a restart.
+
+Then check everything between this machine and the Shield:
+
+```sh
+mcp-server-shieldtv doctor
+```
+
+```
+Shield 192.168.1.50
+   ok config    paired with SHIELD Android TV (MAC xx:xx:xx:xx:B2:C3) at x.x.x.50; credentials load and are private
+   ok tcp       ports 6466 and 6467 accept connections
+   ok identity  SHIELD Android TV, MAC xx:xx:xx:xx:B2:C3
+   ok session   NVIDIA SHIELD Android TV (remote service <version>); on, com.google.android.tvlauncher in front, ...
+```
+
+`doctor` checks each layer in order and stops at the first failure, saying what it means and
+which [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md) step covers it. It never presses a
+key, launches anything or pairs. Output is redacted (addresses, MACs) unless `--no-redact`.
 
 **Treat `cert.pem` and `key.pem` like a password.** Anyone who has them can control your
 Shield. The directory is created `0700` and the files `0600`, and `.gitignore` excludes
@@ -115,6 +147,57 @@ clients ask before running it.
 ```
 
 For Claude Code: `claude mcp add shieldtv -- /path/to/.venv/bin/mcp-server-shieldtv`.
+
+### HTTP and Cloudflare Access
+
+To share one server between Claude Code, Claude Desktop and the mobile app, run it as a
+service and reach it through a Cloudflare Tunnel with Access in front:
+
+```sh
+CF_ACCESS_TEAM_DOMAIN=<team>.cloudflareaccess.com CF_ACCESS_AUD=<aud tag> \
+  mcp-server-shieldtv --http --public-host mcp.example.com      # 127.0.0.1:8712/shieldtv/mcp
+```
+
+| Flag | Variable | Default |
+|---|---|---|
+| `--bind` | `MCP_HTTP_BIND` | `127.0.0.1` |
+| `--port` | `MCP_HTTP_PORT` | `8712` (Onkyo 8711, Harmony 8713) |
+| `--path` | `MCP_HTTP_PATH` | `/shieldtv/mcp` |
+| `--public-host` | `MCP_PUBLIC_HOSTS` | none: only loopback Host headers pass |
+| | `CF_ACCESS_TEAM_DOMAIN`, `CF_ACCESS_AUD` | none: no Access checks |
+| | `MCP_ALLOWED_EMAILS` | anyone Access lets in |
+
+With Access configured, every request needs a valid `Cf-Access-Jwt-Assertion`: the signature
+(the team's published keys), audience, issuer, expiry, and the email allow-list if set.
+Anything else gets a plain 403. The server **refuses to start** on a non-loopback address
+without Access unless you pass `--insecure-no-auth` (for trusted-LAN testing only). It also
+checks `Host` and `Origin` (DNS-rebinding protection), including on `--bind 0.0.0.0`.
+`GET /healthz` answers without auth. `src/shieldtv_mcp/remote.py` is identical in all four
+servers.
+
+### As a service on Alpine (Proxmox LXC)
+
+```sh
+sh deploy/alpine/install.sh                      # as root; or: install.sh /path/to/checkout
+su -s /bin/sh mcp-shieldtv -c 'SHIELDTV_CONFIG_DIR=/var/lib/mcp-server-shieldtv \
+  /opt/mcp-server-shieldtv/venv/bin/mcp-server-shieldtv pair --host <shield ip>'
+vi /etc/mcp-server-shieldtv/env                  # HTTP and Access settings
+rc-update add mcp-server-shieldtv default && rc-service mcp-server-shieldtv start
+```
+
+| Path | Owner, mode | Holds |
+|---|---|---|
+| `/opt/mcp-server-shieldtv/venv` | root, 0755 | The code |
+| `/etc/mcp-server-shieldtv/env` | root:mcp-shieldtv, 0640 | HTTP and Access settings |
+| `/var/lib/mcp-server-shieldtv/` | mcp-shieldtv, 0700 (files 0600) | `cert.pem`, `key.pem`, `adbkey`, `config.json` |
+| `/var/log/mcp-server-shieldtv/server.log` | mcp-shieldtv, 0750 | Logs, redacted |
+| `/etc/init.d/mcp-server-shieldtv` | root, 0755 | OpenRC script (`supervise-daemon`, restarts on exit) |
+
+The credentials live in `/var/lib`, owned by the unprivileged `mcp-shieldtv` user, because
+they're the service's own: `pair` runs as that user, and the server rewrites `config.json`
+when the Shield moves. Every dependency has a musl wheel, so nothing compiles.
+`deploy/alpine/smoke-test.sh` runs the whole install in a `python:3.12-alpine` container
+against the simulator, and CI runs it on every push.
 To point it at a particular Shield without editing `config.json`, pass the host as an
 environment variable: `claude mcp add shieldtv -e SHIELDTV_HOST=192.168.1.50 -- ...`.
 That Shield must already be paired with the same credentials (`pair --host <ip>` once per
@@ -127,14 +210,22 @@ Shield; note that `pair` also saves its host as the default in `config.json`).
 | `SHIELDTV_HOST` | *(from `config.json`)* | The Shield's IP address or hostname |
 | `SHIELDTV_CONFIG_DIR` | `$XDG_CONFIG_HOME/mcp-server-shieldtv` | Where the certificate, key and `config.json` live |
 | `XDG_CONFIG_HOME` | `~/.config` | Standard base directory, used when `SHIELDTV_CONFIG_DIR` is unset |
+| `SHIELDTV_DRY_RUN` | off | Read the Shield, send nothing that changes anything (`serve --dry-run`) |
+| `SHIELDTV_DEBUG` | off | Log the protocol traffic to stderr (`--debug`) |
+| `SHIELDTV_LOG_UNREDACTED` | off | Show LAN addresses and MACs in logs (`--no-redact`); keys and tokens stay hidden |
 
 `config.json` (written by `pair`, safe to edit by hand):
 
 | Key | What it does |
 |---|---|
-| `host` | The Shield's address, saved by `pair` |
+| `host` | The Shield's address, saved by `pair` (and updated if the Shield moves) |
+| `name`, `mac` | The Shield's name and MAC, read from its certificate by `pair` |
 | `apps` | Extra or overriding app names for `launch_app` (see below) |
 | `adb` | `true` once `adb-setup` succeeds; enables the ADB tools |
+| `port`, `pairing_port` | `6466` and `6467`; other values are for the simulator |
+
+Problems in `config.json` (invalid JSON, a bad app entry) are logged at startup and shown by
+`doctor`, and only the bad part is ignored.
 
 When the host is set in more than one place, the most specific wins: `pair --host`, then
 `SHIELDTV_HOST`, then `config.json`.
@@ -143,7 +234,7 @@ When the host is set in more than one place, the most specific wins: `pair --hos
 
 | Tool | What it does |
 |---|---|
-| `get_status` | Reachability, power (`on`/`standby`), foreground app, volume (`null` when not reported), device info |
+| `get_status` | Reachability, power (`on`/`standby`), foreground app, volume (`null` when not reported), device info; while unreachable, `stale: true` with `as_of` and `error` |
 | `list_apps` | The app names `launch_app` accepts |
 | `send_key` | Press an allow-listed remote key, optionally repeated 1-10 times (see below) |
 | `launch_app` | Launch an allow-listed app by friendly name, and confirm it reached the foreground |
@@ -152,7 +243,55 @@ When the host is set in more than one place, the most specific wins: `pair --hos
 | `get_remotes` | Each Bluetooth remote and whether it works, with a fix for stuck ones. Needs `adb-setup` |
 | `reboot_shield` | Restart the Shield, wait until it's back, then check the remotes. Needs `adb-setup` |
 
-`get_status` and the ADB tools return structured content with a published output schema.
+Every tool returns structured content with a published output schema. The actions
+(`send_key`, `launch_app`, `set_power`, and `reboot_shield`'s first fields) return the same
+**ActionResult** shape as the sibling servers:
+
+```json
+{"shield": "SHIELD Android TV", "outcome": "done",
+ "detail": "Launched netflix (com.netflix.ninja is in the foreground)",
+ "sent": ["app_link https://www.netflix.com/title"], "warnings": []}
+```
+
+`outcome` is `done`, `unchanged` (e.g. `set_power off` while already in standby: nothing is
+sent) or `dry_run`. Failures are MCP errors with a sentence that says what to do.
+
+**Dry run** (`serve --dry-run`, `call --dry-run` or `SHIELDTV_DRY_RUN=1`) reads the Shield and
+validates every call as usual, but sends nothing; results say what would have been sent.
+
+### Resources and prompts
+
+Resources are context a client attaches (in Claude Code: `@shieldtv:shieldtv://apps`). Reading
+them sends nothing to the Shield.
+
+| Resource | What it holds |
+|---|---|
+| `shieldtv://apps` | The apps `launch_app` accepts: link, package, and whether each is a default or from `config.json` |
+| `shieldtv://keys` | The keys `send_key` accepts, and the ones left out on purpose, with why |
+
+Prompts are workflows you pick (in Claude Code: `/mcp__shieldtv__watch netflix`).
+
+| Prompt | Arguments | Does |
+|---|---|---|
+| `watch` | `app`, `what` | Wakes the Shield, opens the app, navigates with the D-pad while asking you what's on screen |
+| `remotes_not_working` | | Runs `get_remotes` and repeats its advice; doesn't reboot unless you ask |
+
+### Movie night across servers
+
+The servers don't know about each other: each works alone, and a client with several
+connected composes them. With all four connected, *"movie night in the theater: Plex on the
+Shield, receiver in Dolby Surround at 45"* becomes (tool names as of these versions):
+
+```
+harmony.start_activity   activity="Watch Shield"          # TV and receiver on, inputs switched
+shieldtv.launch_app      app="plex"
+onkyo.set_listening_mode receiver="Theater" mode="dolby-surround"
+onkyo.set_volume         receiver="Theater" level=45      # capped server-side if above the cap
+```
+
+What makes this safe to hand to a model is that limits live in each server, not in the
+prompt: only allow-listed keys and apps here, and the volume cap and never-guess-a-receiver
+rule in Onkyo.
 
 Allowed keys: `HOME`, `BACK`, `MENU`, `DPAD_UP`/`DOWN`/`LEFT`/`RIGHT`/`CENTER`,
 `MEDIA_PLAY_PAUSE`, `MEDIA_PLAY`, `MEDIA_PAUSE`, `MEDIA_STOP`, `MEDIA_NEXT`,
@@ -227,8 +366,17 @@ app, the app usually still opens, but its own scheme (if it has one) avoids the 
 ## Behavior notes
 
 - The server keeps **one long-lived connection** and caches pushed state. If the Shield is
-  asleep or offline at startup it retries in the background, and tool calls return a clear
-  "can't reach the Shield" message in the meantime.
+  asleep or offline at startup it retries in the background (1 s doubling to 60 s), and tool
+  calls return a clear "can't reach the Shield" message in the meantime. Each attempt is
+  bounded (15 s), so a Shield that accepts the connection but never starts a session can't
+  hang the server.
+- **While disconnected, `get_status` still shows the last known values**, marked
+  `stale: true`, with `as_of` (when they arrived) and `error` (why it isn't reachable).
+- **If the Shield moves to another address** (DHCP), after 60 s unreachable the server looks
+  for it over mDNS and checks each candidate's certificate for the MAC that `pair` saved. Only
+  an exact match is adopted, and saved to `config.json`. Any other device is never guessed at.
+- **If the Shield stops trusting the certificate** (unpaired on the TV, factory reset), the
+  error says to re-run `pair`, and the running server picks up the new pairing by itself.
 - Volume keys act on whatever the Shield is configured to control (the Shield itself, HDMI-CEC,
   or IR), so results depend on your setup. When volume goes to a TV or receiver over CEC, the
   Shield doesn't report a level, and `get_status` returns `volume: null`.
@@ -244,12 +392,17 @@ these:
 
 **"The Shield rejected our pairing."** The Shield no longer trusts this certificate,
 typically after a factory reset or after removing the device under the Shield's
-remote/connected-device settings. Run `pair` again.
+remote/connected-device settings. Run `pair` again; a running server reconnects by itself.
+
+**"Can't connect: the pairing files ... can't be used."** `cert.pem` or `key.pem` is
+damaged. Run `pair` again; it sets the old files aside.
 
 **"Can't reach the Shield at ..."** The server is paired but has no connection. The Shield
 may be asleep, rebooting, or off the network, its IP may have changed (a DHCP reservation
 helps), or TCP 6466 may be blocked (see the port table above). The server keeps retrying in
-the background, so the next call may succeed without a restart.
+the background, so the next call may succeed without a restart. If the address changed and
+`config.json` has the Shield's `mac` (saved by `pair` since this version), the server finds
+it again by itself; otherwise re-pair with the new address. `doctor` tells these cases apart.
 
 **"The connection to the Shield dropped; try again in a moment."** The connection closed
 during the command. The library reconnects on its own; retry.
@@ -273,25 +426,103 @@ Server logs (connection attempts, retries, auth failures) go to stderr, which mo
 clients save in their own logs. Running `mcp-server-shieldtv` in a terminal shows them
 directly; it waits for MCP messages on stdin, so stop it with Ctrl+C.
 
+## A session against the simulator
+
+`simulate` runs a **simulated Shield**: TLS on two ports, speaking Android TV Remote v2 the way
+androidtvremote2 does. The real library pairs and connects with it. Pair with it exactly as
+with a real one (the code "on the TV" is printed by the simulator), or pass `--paired`:
+
+```
+$ mcp-server-shieldtv simulate --config-dir /tmp/sim        # terminal 1
+  ...
+  The TV shows the pairing code: 3B26B3
+
+$ export SHIELDTV_CONFIG_DIR=/tmp/sim                         # terminal 2
+$ mcp-server-shieldtv pair --host 127.0.0.1
+Pairing with SHIELD Android TV (00:04:4B:A1:B2:C3). A code will appear on the TV screen.
+Enter the code shown on the TV: 3B26B3
+Paired and connected: NVIDIA SHIELD Android TV
+
+$ mcp-server-shieldtv call launch_app app=netflix
+{ "shield": "SHIELD Android TV", "outcome": "done",
+  "detail": "Launched netflix (com.netflix.ninja is in the foreground)",
+  "sent": ["app_link https://www.netflix.com/title"], "warnings": [] }
+
+$ mcp-server-shieldtv call set_power state=off
+{ ..., "outcome": "done", "detail": "The Shield is in standby", "sent": ["KEYCODE_SLEEP"] }
+
+$ mcp-server-shieldtv call set_power state=off
+{ ..., "outcome": "unchanged", "detail": "The Shield is already in standby", "sent": [] }
+
+$ mcp-server-shieldtv call launch_app app=hulu
+Error executing tool launch_app: The Shield accepted https://www.hulu.com/welcome, but the
+foreground app didn't change within 10s (still com.netflix.ninja). The app may not be
+installed, or no installed app handles that link; the TV may be showing an error. The Shield
+is in standby, which may be why: wake it with set_power first.
+```
+
+(Lines wrapped, some fields elided with `...`.) What the simulator does and where each behavior
+comes from (the library's client code, the owner's Shield, or invented for a test) is listed
+at the top of `src/shieldtv_mcp/sim/fake_shield.py`.
+
 ## Development
 
 ```sh
 pip install -e ".[dev]"
-pytest              # unit + in-process MCP + stdio end-to-end tests, no Shield needed
+pytest -q           # ~200 tests, ~15 s, no Shield needed
 ruff check . && ruff format --check .
 mypy                # strict type checking of src/
 ```
 
-Tests are layered: `test_config.py` (allow-lists, checked against the protocol's own key
-enum), `test_client.py` (connection lifecycle against a fake remote), `test_tools.py`
-(the MCP contract through an in-process client: schemas, annotations, results, errors),
-and `test_stdio.py` (the installed entry point over stdio). CI runs all of it on
-Python 3.11-3.14.
+| Tests | Cover |
+|---|---|
+| `test_config.py` | Allow-lists (checked against the protocol's own key enum), settings, config problems |
+| `test_client.py` | Connection lifecycle and state against `FakeRemote`, a stand-in for the library |
+| `test_wire.py` | The real library against the simulated Shield: pairing (typo, rejection, Cancel, Shield gone), session, drops, garbled frames, sleep, stale state, unpairing, re-pair pickup, an address change (127.0.0.2 to .3) |
+| `test_tools.py`, `test_resources.py` | The MCP contract: schemas, annotations, ActionResults, errors, dry run, resources, prompts |
+| `test_adb.py` | ADB parsers on real dumpsys output; only constant commands reach the shell |
+| `test_tooling.py`, `test_cli.py` | `doctor`, `simulate`, `call`, argument parsing |
+| `test_http_tools.py`, `test_remote.py` | Streamable HTTP end to end; Access JWTs (valid, expired, wrong audience, wrong issuer, missing) with locally generated keys |
+| `test_stdio.py` | The installed entry point over stdio |
+| `test_assumptions.py` | Every assumption is cited by code, and listed here and in HARDWARE_VALIDATION.md |
 
-To poke at the tools interactively: `npx @modelcontextprotocol/inspector mcp-server-shieldtv`.
+CI runs it all on Python 3.11-3.14, plus the Alpine smoke test.
+`npx @modelcontextprotocol/inspector mcp-server-shieldtv` browses tools, resources and prompts
+by hand. [docs/ADB_TOOLS.md](docs/ADB_TOOLS.md) reviews the ADB tools and proposes read-only
+additions (design only).
+
+## Verification status
+
+Hardware-verified means seen on the owner's Shield (what was seen is in each assumption's
+`note` in `src/shieldtv_mcp/assumptions.py`). Simulator-only means the simulator implements
+it and nothing has confirmed it.
+
+| Assumption | Confidence | Status |
+|---|---|---|
+| `S-PAIRING` | high | hardware-verified |
+| `S-REMOTE-HANDSHAKE` | high | hardware-verified |
+| `S-TLS-REJECT` | medium | simulator-only |
+| `S-CERT-MAC` | medium | simulator-only |
+| `S-MDNS` | high | simulator-only |
+| `S-RECONNECT` | high | hardware-verified |
+| `S-SLEEP-CONNECTION` | medium | simulator-only |
+| `S-MARKET-REJECT` | high | hardware-verified |
+| `S-LINK-UNHANDLED` | high | hardware-verified |
+| `S-WAKE-ANY-KEY` | high | hardware-verified |
+| `S-CEC-VOLUME` | high | hardware-verified |
+| `S-APP-LINKS` | high | hardware-verified |
+| `S-DUMPSYS-MEDIA` | high | hardware-verified |
+| `S-LIVE-TV-PACKAGES` | medium | simulator-only |
+| `S-STUCK-REMOTES` | high | hardware-verified |
+| `S-REBOOT-TIME` | high | hardware-verified |
+
+`test_assumptions.py` fails if this table and `assumptions.py` disagree.
 
 ## Roadmap
 
+- Hardware validation of this branch ([HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md))
+- The ADB proposals in [docs/ADB_TOOLS.md](docs/ADB_TOOLS.md), once their outputs are captured
+- Several Shields from one server, by name (as the sibling servers do)
 - Publish to PyPI and the MCP registry
 
 ## License
