@@ -22,6 +22,8 @@ from shieldtv_mcp.client import ShieldClient, ShieldError
 from shieldtv_mcp.config import App, load_settings
 from shieldtv_mcp.sim.fake_shield import LAUNCHER, FakeShield
 
+from .conftest import client_cert, pair
+
 pytestmark = pytest.mark.anyio
 
 
@@ -32,46 +34,6 @@ async def eventually(condition, timeout: float = 5.0) -> None:
         if loop.time() > deadline:
             raise AssertionError("condition never became true")
         await asyncio.sleep(0.02)
-
-
-@pytest.fixture
-def home(tmp_path, monkeypatch):
-    """An empty config directory: nothing paired yet."""
-    monkeypatch.setenv("SHIELDTV_CONFIG_DIR", str(tmp_path))
-    monkeypatch.delenv("SHIELDTV_HOST", raising=False)
-    monkeypatch.delenv("SHIELDTV_DRY_RUN", raising=False)
-    return tmp_path
-
-
-def client_cert(home):
-    def read() -> bytes | None:
-        path = home / "cert.pem"
-        return path.read_bytes() if path.exists() else None
-
-    return read
-
-
-@pytest.fixture
-async def shield(home):
-    s = await FakeShield(client_cert=client_cert(home), ping_interval=1.0).start()
-    # Only the ports: the host comes from pairing (or a test writes it)
-    (home / "config.json").write_text(json.dumps({"port": s.remote_port, "pairing_port": s.pairing_port}))
-    yield s
-    await s.stop()
-
-
-def typed(shield: FakeShield, *codes: str):
-    """A read_code for `pair`: types each given code in turn; "TV" means the
-    code currently on the simulated TV."""
-    pending = list(codes)
-
-    async def read(prompt: str) -> str:
-        if not pending:
-            raise EOFError
-        code = pending.pop(0)
-        return shield.code or "" if code == "TV" else code
-
-    return read
 
 
 def wrong_code(shield: FakeShield, home) -> str:
@@ -85,16 +47,6 @@ def wrong_code(shield: FakeShield, home) -> str:
         if shield._hash(cert, tail)[0] != int(real[:2], 16):
             return real[:2] + tail.hex().upper()
     raise AssertionError("no wrong code found")
-
-
-async def pair(home, shield: FakeShield, *codes: str) -> int:
-    return await cli._cmd_pair(shield.host, read_code=typed(shield, *codes))
-
-
-@pytest.fixture
-async def paired(home, shield):
-    assert await pair(home, shield, "TV") == 0
-    return shield
 
 
 @pytest.fixture
@@ -379,3 +331,11 @@ async def test_a_different_device_at_the_new_address_is_not_adopted(home, two_ad
     finally:
         await c.stop()
         await second.stop()
+
+
+async def test_launch_while_asleep_says_so(connected, paired, monkeypatch):
+    # Whether a real Shield wakes for an app link is unknown; the simulator doesn't
+    monkeypatch.setattr(ShieldClient, "launch_timeout", 0.3)
+    await connected.set_power(False)
+    with pytest.raises(ShieldError, match="in standby, which may be why"):
+        await connected.launch(App("https://www.netflix.com/title", "com.netflix.ninja"))

@@ -1,4 +1,4 @@
-"""Entry point: ``mcp-server-shieldtv [serve] | pair | discover | adb-setup``.
+"""Entry point: ``mcp-server-shieldtv [serve] | pair | discover | adb-setup | doctor | simulate | call``.
 
 ``serve`` is the default, so ``mcp-server-shieldtv`` alone runs the MCP server
 over stdio, and ``mcp-server-shieldtv --http`` works as well as
@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import dataclasses
+import json
 import logging
 import os
 import sys
@@ -41,12 +43,16 @@ def _setup_logging(args: argparse.Namespace) -> None:
     """stderr only (stdout belongs to the MCP stdio transport), redacted: LAN
     addresses and MACs are masked unless --no-redact / SHIELDTV_LOG_UNREDACTED=1;
     keys, certificates and JWTs always are."""
-    unredacted = getattr(args, "no_redact", False) or _flag(os.environ.get("SHIELDTV_LOG_UNREDACTED"))
+    unredacted = _unredacted(args)
     debug = getattr(args, "debug", False) or _flag(os.environ.get("SHIELDTV_DEBUG"))
     setup_logging(logging.DEBUG if debug else logging.INFO, redacted=not unredacted)
     if not debug:
         # The library logs every message it sends and receives at DEBUG; keep INFO readable.
         logging.getLogger("androidtvremote2").setLevel(logging.INFO)
+
+
+def _unredacted(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "no_redact", False)) or _flag(os.environ.get("SHIELDTV_LOG_UNREDACTED"))
 
 
 def _flag(value: str | None) -> bool:
@@ -244,6 +250,115 @@ async def _cmd_adb_setup() -> int:
     return 0
 
 
+async def _cmd_doctor(args: argparse.Namespace, redacted: bool) -> int:
+    from .doctor import render, run_doctor, to_json
+
+    report = await run_doctor(load_settings(), timeout=args.timeout, finder=None if args.no_mdns else _mdns_finder)
+    print(to_json(report, redacted) if args.json else render(report, redacted))
+    return 0 if report.ok else 1
+
+
+async def _mdns_finder(timeout: float) -> dict[str, str]:
+    return await discover(timeout)
+
+
+async def _cmd_simulate(args: argparse.Namespace) -> int:
+    """Run a simulated Shield and point a config directory at it.
+
+    Without --paired, pair with it as with a real one, in another terminal:
+    the code "on the TV" is printed here. The simulator trusts the client
+    certificate from that directory (see sim/fake_shield.py for why).
+    """
+    from pathlib import Path
+
+    from .sim.fake_shield import FakeShield
+
+    home = Path(args.config_dir).expanduser()
+    home.mkdir(parents=True, exist_ok=True)
+    home.chmod(0o700)
+
+    def client_cert() -> bytes | None:
+        path = home / "cert.pem"
+        return path.read_bytes() if path.exists() else None
+
+    def show(code: str) -> None:
+        print(f"\n  The TV shows the pairing code: {code}\n", flush=True)
+
+    shield = FakeShield(host=args.host, remote_port=args.port, client_cert=client_cert, on_code=show)
+    try:
+        await shield.start()
+    except OSError as exc:
+        print(f"Couldn't start the simulated Shield: {exc}", file=sys.stderr)
+        return 1
+    os.environ["SHIELDTV_CONFIG_DIR"] = str(home)
+    save_config(port=shield.remote_port, pairing_port=shield.pairing_port)
+    if args.paired:
+        from androidtvremote2.certificate_generator import generate_selfsigned_cert
+
+        settings = load_settings()
+        if check_credentials(settings) is not None or not settings.cert_path.exists():
+            cert, key = generate_selfsigned_cert(CLIENT_NAME)
+            settings.cert_path.write_bytes(cert)
+            settings.key_path.write_bytes(key)
+            lock_down_credentials(settings)
+        shield.pair_with(settings.cert_path.read_bytes())
+        save_config(host=args.host, name=shield.name, mac=shield.mac)
+    print(f"Simulated {shield.name} (MAC {shield.mac}) on {args.host}:")
+    print(f"  remote port {shield.remote_port}, pairing port {shield.pairing_port} (saved in {home}/config.json)")
+    print("It implements the protocol as androidtvremote2 speaks it; see assumptions.py for what is unconfirmed.\n")
+    print("In another terminal:")
+    print(f"  export SHIELDTV_CONFIG_DIR={home}")
+    if not args.paired:
+        print(f"  mcp-server-shieldtv pair --host {args.host}      # type the code shown here")
+    print("  mcp-server-shieldtv doctor --no-mdns")
+    print("  mcp-server-shieldtv call get_status")
+    print("Ctrl+C to stop.", flush=True)
+    try:
+        await asyncio.Event().wait()
+    finally:
+        await shield.stop()
+    return 0
+
+
+async def _cmd_call(tool: str, raw_args: list[str], wait_s: float = 5.0) -> int:
+    """One tool call through the real MCP layer, as the model would make it."""
+    from mcp import Client
+
+    from .server import client, mcp
+
+    tool_args: dict[str, object] = {}
+    for pair in raw_args:
+        key, sep, raw = pair.partition("=")
+        if not sep:
+            print(f"arguments are key=value, got {pair!r}", file=sys.stderr)
+            return 2
+        try:
+            tool_args[key] = json.loads(raw)  # repeat=3 -> 3
+        except json.JSONDecodeError:
+            tool_args[key] = raw  # app=netflix -> a string
+    async with Client(mcp) as c:
+        if tool == "tools":
+            for t in (await c.list_tools()).tools:
+                print(f"{t.name:<16} {(t.description or '').splitlines()[0]}")
+            return 0
+        # The server connects in the background; give it a moment, as a
+        # long-running server would have had
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + wait_s
+        sc = client()
+        while sc.settings.paired and not sc.available and not sc.auth_failed and loop.time() < deadline:
+            await asyncio.sleep(0.1)
+        result = await c.call_tool(tool, tool_args)
+    if result.is_error:
+        print(" ".join(getattr(part, "text", "") for part in result.content) or "error", file=sys.stderr)
+        return 1
+    body = result.structured_content
+    if isinstance(body, dict) and set(body) == {"result"}:
+        body = body["result"]
+    print(json.dumps(body, indent=2, ensure_ascii=False))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="mcp-server-shieldtv", description=__doc__.split("\n\n")[0])
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -267,6 +382,21 @@ def build_parser() -> argparse.ArgumentParser:
     p_disc = sub.add_parser("discover", parents=[common], help="list Android TV devices on the LAN")
     p_disc.add_argument("--timeout", type=float, default=5.0)
     sub.add_parser("adb-setup", parents=[common], help="enable the optional ADB tools (now playing, remotes, reboot)")
+    doc = sub.add_parser(
+        "doctor", parents=[common], help="check config, network and pairing, layer by layer (read-only)"
+    )
+    doc.add_argument("--json", action="store_true", help="machine-readable output")
+    doc.add_argument("--timeout", type=float, default=5.0, help="seconds per step (default 5)")
+    doc.add_argument("--no-mdns", action="store_true", help="skip the mDNS search")
+    sim = sub.add_parser("simulate", parents=[common], help="run a simulated Shield, for testing without one")
+    sim.add_argument("--config-dir", required=True, metavar="DIR", help="config directory to point at the simulator")
+    sim.add_argument("--host", default="127.0.0.1", help="address to listen on (default 127.0.0.1)")
+    sim.add_argument("--port", type=int, default=0, help="remote port (default: a free one; pairing uses another)")
+    sim.add_argument("--paired", action="store_true", help="skip pairing: make credentials and trust them")
+    cal = sub.add_parser("call", parents=[common], help="call one tool as the model would and print the result")
+    cal.add_argument("tool", help="tool name, or 'tools' to list them")
+    cal.add_argument("args", nargs="*", metavar="key=value", help="tool arguments (values are JSON if they parse)")
+    cal.add_argument("--dry-run", action="store_true", help="send nothing that changes anything")
     return parser
 
 
@@ -290,6 +420,14 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(asyncio.run(_cmd_discover(args.timeout)))
     if args.cmd == "adb-setup":
         sys.exit(asyncio.run(_cmd_adb_setup()))
+    if args.cmd == "doctor":
+        sys.exit(asyncio.run(_cmd_doctor(args, redacted=not _unredacted(args))))
+    if args.cmd == "simulate":
+        with contextlib.suppress(KeyboardInterrupt):
+            sys.exit(asyncio.run(_cmd_simulate(args)))
+        return
+    if args.cmd == "call":
+        sys.exit(asyncio.run(_cmd_call(args.tool, args.args)))
 
     from .server import mcp  # imported late: `pair` and `discover` don't need the server code
 

@@ -469,10 +469,13 @@ class ShieldClient:
         if await self._wait_for(opened, self.launch_timeout):
             assert self.current_app is not None
             return self.current_app
+        asleep = (
+            " The Shield is in standby, which may be why: wake it with set_power first." if self.is_on is False else ""
+        )
         raise ShieldError(
             f"The Shield accepted {app.target}, but the foreground app didn't change within "
             f"{self.launch_timeout:.0f}s (still {self.current_app or 'unknown'}). The app may not be "
-            "installed, or no installed app handles that link; the TV may be showing an error."
+            f"installed, or no installed app handles that link; the TV may be showing an error.{asleep}"
         )
 
     async def _wait_for(self, condition: Callable[[], bool], timeout: float) -> bool:

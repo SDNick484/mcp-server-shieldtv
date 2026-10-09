@@ -30,6 +30,7 @@ behaves like this. Every behavior below names its source:
   handshake, which it reports as InvalidAuth ("pair again"). ASSUMPTION
   S-TLS-REJECT.
   invented here, as switches (``Faults``) for tests:
+    - an app link while in standby opens nothing (what a real one does is unknown);
     - never sending remote_start, dropping after N messages, garbling a frame,
       refusing connections, dropping the session when going to sleep
       (ASSUMPTION S-SLEEP-CONNECTION says the real one keeps it).
@@ -280,6 +281,10 @@ class FakeShield:
             asyncio.get_running_loop().call_later(0.05, session.close)
             return
         package = self.handlers.get(link)
+        if package and not self.is_on:
+            # Invented: what a sleeping Shield does with an app link is unknown.
+            # The fake ignores it, which is the case the server must explain.
+            return
         if package:
             self.set_app(package)
         # else: accepted, nothing opens (seen on the owner's Shield)

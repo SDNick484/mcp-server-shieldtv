@@ -9,8 +9,10 @@ from collections.abc import Callable
 import pytest
 from androidtvremote2 import ConnectionClosed, DeviceInfo, VolumeInfo
 
+from shieldtv_mcp import cli
 from shieldtv_mcp.client import ShieldClient
 from shieldtv_mcp.config import Settings, load_settings
+from shieldtv_mcp.sim.fake_shield import FakeShield
 
 
 # Async tests use anyio's pytest plugin (marked with pytest.mark.anyio) rather
@@ -164,3 +166,54 @@ async def wait_until(condition: Callable[[], bool], tries: int = 100) -> None:
             return
         await asyncio.sleep(0)
     raise AssertionError("condition never became true")
+
+
+# --- the simulated Shield (sim/fake_shield.py), for test_wire and test_tooling --------------
+@pytest.fixture
+def home(tmp_path, monkeypatch):
+    """An empty config directory: nothing paired yet."""
+    monkeypatch.setenv("SHIELDTV_CONFIG_DIR", str(tmp_path))
+    monkeypatch.delenv("SHIELDTV_HOST", raising=False)
+    monkeypatch.delenv("SHIELDTV_DRY_RUN", raising=False)
+    return tmp_path
+
+
+def client_cert(home):
+    def read() -> bytes | None:
+        path = home / "cert.pem"
+        return path.read_bytes() if path.exists() else None
+
+    return read
+
+
+@pytest.fixture
+async def shield(home):
+    s = await FakeShield(client_cert=client_cert(home), ping_interval=1.0).start()
+    # Only the ports: the host comes from pairing (or a test writes it)
+    (home / "config.json").write_text(json.dumps({"port": s.remote_port, "pairing_port": s.pairing_port}))
+    yield s
+    await s.stop()
+
+
+def typed(shield: FakeShield, *codes: str):
+    """A read_code for `pair`: types each given code in turn; "TV" means the
+    code currently on the simulated TV."""
+    pending = list(codes)
+
+    async def read(prompt: str) -> str:
+        if not pending:
+            raise EOFError
+        code = pending.pop(0)
+        return shield.code or "" if code == "TV" else code
+
+    return read
+
+
+async def pair(home, shield: FakeShield, *codes: str) -> int:
+    return await cli._cmd_pair(shield.host, read_code=typed(shield, *codes))
+
+
+@pytest.fixture
+async def paired(home, shield):
+    assert await pair(home, shield, "TV") == 0
+    return shield
