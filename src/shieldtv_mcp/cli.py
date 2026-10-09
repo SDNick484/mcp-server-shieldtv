@@ -256,6 +256,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="cmd")
     p_serve = sub.add_parser("serve", parents=[common], help="run the MCP server (stdio by default, or --http)")
+    p_serve.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="read the Shield, but send nothing that changes anything (SHIELDTV_DRY_RUN=1)",
+    )
     remote.add_http_arguments(p_serve, default_port=8712, default_path="/shieldtv/mcp")
     p_pair = sub.add_parser("pair", parents=[common], help="one-time pairing with a Shield")
     p_pair.add_argument("--host", help="Shield IP address (skips mDNS discovery)")
@@ -275,6 +280,8 @@ def normalize(argv: list[str]) -> list[str]:
 def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(normalize(sys.argv[1:] if argv is None else argv))
+    if getattr(args, "dry_run", False):
+        os.environ["SHIELDTV_DRY_RUN"] = "1"  # the server's lifespan reads settings from the environment
     _setup_logging(args)
 
     if args.cmd == "pair":

@@ -52,6 +52,7 @@ NOW_PLAYING_COMMAND = "dumpsys media_session; echo __UPTIME__; cat /proc/uptime"
 REMOTES_COMMAND = "dumpsys bluetooth_manager; echo __INPUT__; dumpsys input"
 BOOT_COMMAND = "getprop sys.boot_completed"  # "1" once Android has finished booting
 COMMANDS = frozenset({NOW_PLAYING_COMMAND, REMOTES_COMMAND, BOOT_COMMAND})
+REBOOT = "adb reboot"  # how a reboot is listed in results' `sent` (the ADB reboot service, not a shell)
 
 # android.media.session.PlaybackState constants.
 PlayState = Literal["playing", "paused", "buffering", "stopped", "other", "idle"]
@@ -209,7 +210,11 @@ class RemotesReport(TypedDict):
 
 
 class RebootResult(TypedDict):
-    back_after_s: float
+    # The fields every action shares (ActionResult in server.py), then the reboot's own
+    outcome: Literal["done", "dry_run"]
+    detail: str
+    sent: list[str]
+    back_after_s: float | None
     remotes: list[Remote]
     advice: str | None
 
@@ -449,4 +454,25 @@ async def reboot_and_check(
     await sleep(REMOTES_SETTLE_S)
     remotes = parse_remotes(await run_command(settings, REMOTES_COMMAND, device_factory=device_factory))
     missing = [r for r in remotes if r["address"] in expected and r["state"] in ("disconnected", "connecting")]
-    return {"back_after_s": round(booted_at - start, 1), **remotes_report(remotes, missing)}
+    back = round(booted_at - start, 1)
+    return {
+        "outcome": "done",
+        "detail": f"Rebooted; the Shield was back after {back:.0f}s",
+        "sent": [REBOOT],
+        "back_after_s": back,
+        **remotes_report(remotes, missing),
+    }
+
+
+def reboot_dry_run(settings: Settings) -> RebootResult:
+    """What reboot_and_check would do, without connecting. Still checks that
+    ADB is set up, so a dry run fails where the real call would."""
+    _signer_and_host(settings)
+    return {
+        "outcome": "dry_run",
+        "detail": "DRY RUN, nothing sent: would reboot the Shield over ADB and check the remotes afterwards",
+        "sent": [REBOOT],
+        "back_after_s": None,
+        "remotes": [],
+        "advice": None,
+    }

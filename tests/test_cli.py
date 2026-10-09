@@ -31,3 +31,8 @@ def test_other_commands_parse_as_before():
 def test_version_and_help_are_not_rewritten():
     assert cli.normalize(["--version"]) == ["--version"]
     assert cli.normalize(["-h"]) == ["-h"]
+
+
+def test_serve_dry_run_flag():
+    args = cli.build_parser().parse_args(cli.normalize(["--dry-run", "--http"]))
+    assert args.dry_run and args.http

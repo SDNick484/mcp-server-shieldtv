@@ -138,7 +138,9 @@ def test_snapshot_before_connecting(settings):
     snap = ShieldClient(settings).snapshot()
     assert snap == {
         "host": "192.0.2.10",
+        "name": None,
         "paired": True,
+        "dry_run": False,
         "reachable": False,
         "stale": False,  # nothing known yet, so nothing stale
         "as_of": None,

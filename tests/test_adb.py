@@ -379,3 +379,10 @@ async def test_reboot_that_never_comes_back_is_an_error(adb_settings):
 
 def states_of(result) -> dict[str, str]:
     return {r["address"]: r["state"] for r in result["remotes"]}
+
+
+def test_reboot_dry_run_sends_nothing(adb_settings):
+    from shieldtv_mcp.adb import reboot_dry_run
+
+    result = reboot_dry_run(adb_settings)
+    assert (result["outcome"], result["sent"], result["back_after_s"]) == ("dry_run", ["adb reboot"], None)

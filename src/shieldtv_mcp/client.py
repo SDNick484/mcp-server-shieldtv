@@ -86,7 +86,9 @@ class Device(TypedDict):
 
 class Status(TypedDict):
     host: str | None
+    name: str | None  # as saved by `pair`
     paired: bool
+    dry_run: bool  # true: actions are reported, not sent
     reachable: bool
     # True when not reachable now: power, app and volume are the last values
     # the Shield pushed, at as_of, and may no longer be true.
@@ -488,6 +490,8 @@ class ShieldClient:
         return False
 
     def _run(self, fn: Callable[[AndroidTVRemote], None]) -> None:
+        # Tools return before this in a dry run; this is the backstop.
+        assert not self.settings.dry_run, "dry run must not send anything"
         remote = self._require()
         # _require() passing isn't a guarantee: the connection can drop before
         # the library reports it via the is_available callback, and the send
@@ -512,7 +516,9 @@ class ShieldClient:
             error = self.error
         return {
             "host": self.settings.host,
+            "name": self.settings.name,
             "paired": self.settings.paired,
+            "dry_run": self.settings.dry_run,
             "reachable": self.available,
             "stale": known and not self.available,
             "as_of": datetime.fromtimestamp(self.as_of, UTC).isoformat(timespec="seconds") if self.as_of else None,
