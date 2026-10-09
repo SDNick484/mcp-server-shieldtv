@@ -108,6 +108,7 @@ async def _cmd_pair(
     2. Read the Shield's name and MAC from its certificate (no code shown yet).
     3. Start pairing: the Shield shows a code on the TV. Send back the code
        the user typed; the Shield now trusts our certificate. Up to 3 tries.
+       ASSUMPTION S-PAIRING.
     4. Connect with it once to prove it works, then save host, name and MAC.
        The MAC is how a running server recognizes the Shield if its address
        changes (ShieldClient.rediscover); a running server also notices the

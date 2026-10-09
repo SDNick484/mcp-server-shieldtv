@@ -76,6 +76,7 @@ class App:
 # checked on a real Shield (2026-10): the link opened that package. Plex and
 # Spotify use their own schemes: only the app handles those, while the https
 # links also match the browser stub (open.spotify.com matches only the stub).
+# ASSUMPTION S-APP-LINKS.
 DEFAULT_APPS: dict[str, App] = {
     "youtube": App("https://www.youtube.com", "com.google.android.youtube.tv"),
     "youtube-tv": App("https://tv.youtube.com", "com.google.android.youtube.tvunplugged"),

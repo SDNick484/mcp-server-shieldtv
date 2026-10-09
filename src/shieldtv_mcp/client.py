@@ -158,6 +158,7 @@ class ShieldClient:
       drops       - how many times the connection has been lost. A counter, not
                     a flag: the library reconnects within ~0.1s, so a drop can
                     come and go between two looks at ``available``.
+                    ASSUMPTION S-RECONNECT.
 
     Everything runs on the server's single asyncio event loop, so the callbacks
     and tools never run at the same time and need no locks.
@@ -423,6 +424,7 @@ class ShieldClient:
 
         WAKEUP/SLEEP are explicit; the POWER key is a toggle and is not allowed.
         Like launch(), a sent key proves nothing, so wait for the pushed is_on.
+        ASSUMPTION S-WAKE-ANY-KEY.
         """
         self._run(lambda r: r.send_key_command("WAKEUP" if on else "SLEEP"))
         if not await self._wait_for(lambda: self.is_on is on, self.power_timeout):
@@ -442,6 +444,7 @@ class ShieldClient:
           - the Shield accepts it, but nothing opens (app not installed, or no
             app handles the link), so the foreground app never changes.
         So instead of trusting the send, watch what the Shield pushes back.
+        ASSUMPTION S-MARKET-REJECT, S-LINK-UNHANDLED.
         """
         before = self.current_app
         drops = self.drops
@@ -500,7 +503,7 @@ class ShieldClient:
         # (TypedDicts), not objects: index them, don't use attributes.
         # Volume max 0 means the Shield isn't reporting volume, typically
         # because HDMI-CEC hands it to a TV or receiver. Report that as unknown,
-        # not as "level 0 of 0".
+        # not as "level 0 of 0". ASSUMPTION S-CEC-VOLUME.
         vol = self.volume if self.volume and self.volume["max"] > 0 else None
         info = self._remote.device_info if self._remote else None
         known = self.is_on is not None or self.current_app is not None or self.volume is not None
