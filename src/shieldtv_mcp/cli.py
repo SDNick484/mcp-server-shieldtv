@@ -13,6 +13,8 @@ import dataclasses
 import logging
 import os
 import sys
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 from androidtvremote2 import (
     AndroidTVRemote,
@@ -22,6 +24,7 @@ from androidtvremote2 import (
 )
 
 from . import __version__, remote
+from .client import check_credentials
 from .config import (
     CLIENT_NAME,
     config_dir,
@@ -29,7 +32,6 @@ from .config import (
     load_settings,
     lock_down_credentials,
     save_config,
-    save_host,
 )
 from .discovery import discover
 from .logsafe import setup_logging
@@ -87,13 +89,32 @@ async def _pick_host(host: str | None) -> str | None:
         return None
 
 
-async def _cmd_pair(host_arg: str | None) -> int:
+CodeReader = Callable[[str], Awaitable[str]]
+
+
+async def _read_code(prompt: str) -> str:
+    # input() blocks; running it in a thread keeps the event loop (and the
+    # open pairing connection) alive while the user types.
+    return await asyncio.to_thread(input, prompt)
+
+
+async def _cmd_pair(
+    host_arg: str | None, read_code: CodeReader = _read_code, remote_factory: Callable[..., Any] = AndroidTVRemote
+) -> int:
     """Pair once, so later connections are trusted without a code.
 
-    1. Generate a self-signed client certificate and key (if missing).
-    2. Start pairing: the Shield shows a code on the TV.
-    3. Send back the code the user typed. The Shield now trusts our certificate.
-    4. Connect with it once to prove it works, and save the host.
+    1. Make sure there is a usable client certificate and key: generate them
+       if missing, and set unreadable ones aside (they'd fail every attempt).
+    2. Read the Shield's name and MAC from its certificate (no code shown yet).
+    3. Start pairing: the Shield shows a code on the TV. Send back the code
+       the user typed; the Shield now trusts our certificate. Up to 3 tries.
+    4. Connect with it once to prove it works, then save host, name and MAC.
+       The MAC is how a running server recognizes the Shield if its address
+       changes (ShieldClient.rediscover); a running server also notices the
+       new credentials and reconnects with them, no restart needed.
+
+    read_code and remote_factory are parameters so tests can pair with the
+    simulated Shield without a terminal.
     """
     host = await _pick_host(host_arg)
     if not host:
@@ -101,7 +122,19 @@ async def _cmd_pair(host_arg: str | None) -> int:
 
     ensure_private_dir()
     settings = load_settings(host_override=host)
-    remote = AndroidTVRemote(CLIENT_NAME, str(settings.cert_path), str(settings.key_path), host)
+    problem = check_credentials(settings)
+    if problem:
+        for path in (settings.cert_path, settings.key_path):
+            path.replace(path.with_name(path.name + ".broken"))
+        print(f"Set aside the old credentials ({problem}); making new ones.")
+    remote = remote_factory(
+        CLIENT_NAME,
+        str(settings.cert_path),
+        str(settings.key_path),
+        host,
+        api_port=settings.port,
+        pair_port=settings.pairing_port,
+    )
     # The library writes the key with the process umask (often 0644). A 077
     # umask makes it private from the moment it exists, not just after chmod.
     old_umask = os.umask(0o077)
@@ -114,18 +147,16 @@ async def _cmd_pair(host_arg: str | None) -> int:
     lock_down_credentials(settings)
 
     try:
-        name, mac = await remote.async_get_name_and_mac()
+        name, mac = await asyncio.wait_for(remote.async_get_name_and_mac(), 10.0)
     except (TimeoutError, CannotConnect, OSError) as exc:
         print(f"Can't reach {host}: {exc}\nIs the Shield awake and on the same network?", file=sys.stderr)
         return 1
     print(f"Pairing with {name} ({mac}). A code will appear on the TV screen.")
 
-    for attempt in range(3):
+    for attempt in range(1, 4):
         try:
             await remote.async_start_pairing()
-            # input() blocks; running it in a thread keeps the event loop (and
-            # the open pairing connection) alive while the user types.
-            code = (await asyncio.to_thread(input, "Enter the code shown on the TV: ")).strip()
+            code = (await read_code("Enter the code shown on the TV: ")).strip().upper()
             await remote.async_finish_pairing(code)
             break
         except EOFError:
@@ -133,27 +164,44 @@ async def _cmd_pair(host_arg: str | None) -> int:
             print("\nNo input to read the code from; run `pair` in an interactive terminal.", file=sys.stderr)
             remote.disconnect()
             return 1
-        except (InvalidAuth, ConnectionClosed):
-            print("That didn't work (wrong code or the session timed out).")
-            if attempt == 2:
+        except CannotConnect as exc:
+            # The pairing port stopped answering (the Shield went to sleep, or
+            # left the network) between attempts. Used to escape as a traceback.
+            print(f"Lost the Shield while pairing ({exc or 'no answer on the pairing port'}).", file=sys.stderr)
+            remote.disconnect()
+            return 1
+        except (InvalidAuth, ConnectionClosed) as exc:
+            # InvalidAuth: the code doesn't match (the library checks its first
+            # byte before sending). ConnectionClosed: the TV rejected it, or
+            # Cancel was pressed, or it timed out. Either way a new code is shown.
+            print(f"That didn't work ({_pairing_failure(exc)}).")
+            if attempt == 3:
                 print("Giving up after 3 attempts.", file=sys.stderr)
+                remote.disconnect()
                 return 1
-    save_host(host)
-    lock_down_credentials(settings)
+            print("Starting over; a new code will appear.")
 
-    # Prove the credential works before declaring victory.
+    lock_down_credentials(settings)
+    # Prove the credential works before saving anything.
     try:
-        await remote.async_connect()
+        await asyncio.wait_for(remote.async_connect(), 15.0)
         info = remote.device_info
         model = f"{info['manufacturer']} {info['model']}" if info else "unknown device"
         print(f"Paired and connected: {model}")
-    except (CannotConnect, InvalidAuth, ConnectionClosed, OSError) as exc:
-        print(f"Paired, but the verification connect failed: {exc}", file=sys.stderr)
+    except (TimeoutError, CannotConnect, InvalidAuth, ConnectionClosed, OSError) as exc:
+        print(f"Paired, but the verification connect failed: {exc or type(exc).__name__}", file=sys.stderr)
         return 1
     finally:
         remote.disconnect()
-    print(f"Saved host {host}. Credentials are in {config_dir()} (keep them private).")
+    save_config(host=host, name=name, mac=mac)
+    print(f"Saved {name} at {host} (MAC {mac}). Credentials are in {config_dir()} (keep them private).")
     return 0
+
+
+def _pairing_failure(exc: BaseException) -> str:
+    if isinstance(exc, InvalidAuth):
+        return "that code doesn't match the one on the TV"
+    return "the TV rejected the code, the pairing was cancelled on the TV, or it timed out"
 
 
 async def _cmd_adb_setup() -> int:

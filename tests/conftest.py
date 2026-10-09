@@ -62,8 +62,9 @@ class FakeRemote:
         }
 
     # Passed to ShieldClient as remote_factory; records how it was built.
-    def build(self, client_name: str, certfile: str, keyfile: str, host: str) -> FakeRemote:
+    def build(self, client_name: str, certfile: str, keyfile: str, host: str, **ports: int) -> FakeRemote:
         self.built_with = (client_name, certfile, keyfile, host)
+        self.ports = ports
         return self
 
     def add_is_on_updated_callback(self, cb: Callable) -> None:
@@ -129,13 +130,24 @@ def fake() -> FakeRemote:
     return FakeRemote()
 
 
+@pytest.fixture(scope="session")
+def client_identity() -> tuple[bytes, bytes]:
+    """A real client certificate and key, made the way `pair` makes them (an
+    RSA key takes a moment to generate, so once per test session). They must
+    be real: the client now checks they load before connecting."""
+    from androidtvremote2.certificate_generator import generate_selfsigned_cert
+
+    return generate_selfsigned_cert("mcp-server-shieldtv")
+
+
 @pytest.fixture
-def config_dir(tmp_path, monkeypatch):
+def config_dir(tmp_path, monkeypatch, client_identity):
     """An isolated, paired config directory (never the user's real one)."""
     monkeypatch.setenv("SHIELDTV_CONFIG_DIR", str(tmp_path))
     monkeypatch.delenv("SHIELDTV_HOST", raising=False)
-    (tmp_path / "cert.pem").write_text("x")
-    (tmp_path / "key.pem").write_text("x")
+    monkeypatch.delenv("SHIELDTV_DRY_RUN", raising=False)
+    (tmp_path / "cert.pem").write_bytes(client_identity[0])
+    (tmp_path / "key.pem").write_bytes(client_identity[1])
     (tmp_path / "config.json").write_text(json.dumps({"host": "192.0.2.10", "apps": {"Mine": "com.example.mine"}}))
     return tmp_path
 

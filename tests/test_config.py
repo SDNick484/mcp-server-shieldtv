@@ -105,3 +105,35 @@ def test_save_host_keeps_files_private(tmp_path, monkeypatch):
     assert load_settings().host == "192.0.2.40"
     assert stat.S_IMODE(ensure_private_dir().stat().st_mode) == 0o700
     assert stat.S_IMODE((d / "config.json").stat().st_mode) == 0o600
+
+
+def test_problems_are_reported_not_raised(config_dir):
+    (config_dir / "config.json").write_text(
+        json.dumps({"host": 5, "port": "x", "pairing_port": 70000, "apps": {"bad": 3}})
+    )
+    s = load_settings()
+    assert (s.host, s.port, s.pairing_port) == (None, 6466, 6467)
+    assert s.problems == (
+        "ignoring app 'bad' in config.json: expected a string or {link, package}",
+        "ignoring host 5 in config.json: expected a string",
+        "ignoring port='x': must be a port number",
+        "ignoring pairing_port=70000: must be a port number",
+    )
+
+
+def test_invalid_json_is_a_problem_not_silence(config_dir):
+    (config_dir / "config.json").write_text("{ not json")
+    assert "is not valid JSON" in load_settings().problems[0]
+
+
+def test_name_and_mac_saved_by_pair(config_dir):
+    data = json.loads((config_dir / "config.json").read_text())
+    (config_dir / "config.json").write_text(json.dumps({**data, "name": "SHIELD", "mac": "00:04:4B:A1:B2:C3"}))
+    s = load_settings()
+    assert (s.name, s.mac) == ("SHIELD", "00:04:4B:A1:B2:C3")
+
+
+def test_dry_run_from_the_environment(config_dir, monkeypatch):
+    assert load_settings().dry_run is False
+    monkeypatch.setenv("SHIELDTV_DRY_RUN", "1")
+    assert load_settings().dry_run is True

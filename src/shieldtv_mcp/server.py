@@ -45,7 +45,10 @@ def client() -> ShieldClient:
 @asynccontextmanager
 async def lifespan(_server: MCPServer) -> AsyncIterator[None]:
     global _client
-    _client = ShieldClient(load_settings())
+    settings = load_settings()
+    for problem in settings.problems:
+        log.warning("Config: %s", problem)
+    _client = ShieldClient(settings)
     await _client.start()
     try:
         yield

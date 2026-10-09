@@ -111,6 +111,9 @@ async def test_get_status_publishes_output_schema(mcp_client):
         "host",
         "paired",
         "reachable",
+        "stale",
+        "as_of",
+        "error",
         "power",
         "current_app_package",
         "current_app",
@@ -123,10 +126,14 @@ async def test_get_status_publishes_output_schema(mcp_client):
 async def test_get_status(mcp_client):
     result = await mcp_client.call_tool("get_status", {})
     assert not result.is_error
-    assert result.structured_content == {
+    status = result.structured_content
+    assert status.pop("as_of").endswith("+00:00")  # when the values arrived, UTC
+    assert status == {
         "host": "192.0.2.10",
         "paired": True,
         "reachable": True,
+        "stale": False,
+        "error": None,
         "power": "on",
         "current_app_package": "com.netflix.ninja",
         "current_app": "netflix",
