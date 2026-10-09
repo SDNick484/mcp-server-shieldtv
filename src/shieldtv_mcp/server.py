@@ -13,6 +13,7 @@ How a decorated function becomes a tool the model can call:
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -33,7 +34,7 @@ from .adb import (
     reboot_dry_run,
 )
 from .client import ShieldClient, ShieldError, Status
-from .config import KeyName, load_settings
+from .config import ALLOWED_KEYS, DEFAULT_APPS, KeyName, load_settings
 
 log = logging.getLogger(__name__)
 
@@ -236,3 +237,86 @@ async def set_power(state: Literal["on", "off"]) -> ActionResult:
         return _result(c, "wake the Shield" if on else "put the Shield to sleep", sent, "dry_run")
     await c.set_power(on)
     return _result(c, f"The Shield is {word}", sent)
+
+
+# ---------------------------------------------------------------------------
+# Resources: context a *client* reads (e.g. @-mentioned in Claude Code), as
+# opposed to tools the model calls. They carry reference data that is useful
+# up front and costs nothing to read: no command goes to the Shield.
+#
+#   shieldtv://apps   the apps launch_app accepts: link, package, and where the entry comes from
+#   shieldtv://keys   the keys send_key accepts, and the ones deliberately left out
+# ---------------------------------------------------------------------------
+@mcp.resource("shieldtv://apps", name="apps", title="Apps launch_app can open, and how", mime_type="application/json")
+def apps_resource() -> str:
+    settings = client().settings
+    return json.dumps(
+        {
+            name: {
+                "link": app.target,
+                "package": app.package,
+                # Defaults were checked on the owner's Shield (ASSUMPTION S-APP-LINKS);
+                # config.json entries are yours, unchecked by anyone
+                "source": "default" if DEFAULT_APPS.get(name) == app else "config.json",
+            }
+            for name, app in sorted(settings.apps.items())
+        },
+        indent=1,
+    )
+
+
+@mcp.resource("shieldtv://keys", name="keys", title="Keys send_key can press", mime_type="application/json")
+def keys_resource() -> str:
+    return json.dumps(
+        {
+            "allowed": sorted(ALLOWED_KEYS),
+            "left_out": {
+                "POWER": "a toggle with ambiguous state; set_power uses WAKEUP/SLEEP",
+                "SEARCH": "starts a voice session",
+                "SETTINGS": "opens system settings",
+                "MUTE": "Android's microphone mute (VOLUME_MUTE mutes the sound)",
+                "text:": "typing arbitrary text",
+            },
+        },
+        indent=1,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Prompts: workflows the *user* picks (e.g. /mcp__shieldtv__watch in Claude
+# Code). Text with the arguments filled in; the model carries it out with the
+# tools. They only use this server's tools: a cross-device "movie night" is a
+# README example, so no server depends on another being connected.
+# ---------------------------------------------------------------------------
+@mcp.prompt(title="Watch something on the Shield")
+def watch(app: str, what: str = "") -> str:
+    """Wake the Shield, open an app, and get to what you want to watch."""
+    goal = f" and find {what!r}" if what else ""
+    return (
+        f"Open {app} on the Shield{goal}. Please:\n"
+        "1. Call get_status. If reachable is false, tell me the error and stop.\n"
+        '2. If power is "standby", call set_power with state="on".\n'
+        f"3. Call launch_app with app={app!r}. If it says the app is unknown, call list_apps and ask me which "
+        "one I meant.\n"
+        + (
+            f"4. To find {what!r}, use send_key with DPAD_* keys and DPAD_CENTER, a few presses at a time, and "
+            "ask me what's on screen when you can't tell (you can't see the TV). Don't type text: it isn't "
+            "available.\n"
+            if what
+            else "4. Stop there and tell me it's open.\n"
+        )
+        + "5. If ADB is set up, get_now_playing tells you what is playing; otherwise ask me."
+    )
+
+
+@mcp.prompt(title="My remote stopped working")
+def remotes_not_working() -> str:
+    """Check the Shield's Bluetooth remotes and say how to fix one that's connected but dead."""
+    return (
+        "My remote isn't controlling the Shield. Please:\n"
+        "1. Call get_status to check the Shield is reachable and on.\n"
+        "2. Call get_remotes (needs ADB; if it says ADB isn't set up, tell me to run "
+        "`mcp-server-shieldtv adb-setup` and stop).\n"
+        '3. For any remote whose state is "stuck", repeat the advice get_remotes gives. Do not reboot the '
+        "Shield unless I ask: a reboot is what usually causes this."
+    )
