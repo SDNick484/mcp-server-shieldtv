@@ -57,7 +57,8 @@ async def test_retries_with_backoff_until_reachable(settings, fake, monkeypatch)
     await c.start()
     await wait_until(lambda: c.available)
     assert fake.connect_calls == 4
-    assert [d for d in delays if d] == [1.0, 2.0, 4.0]
+    # (the watchdog's own sleeps, every watch_interval, are left out)
+    assert [d for d in delays if d and d != ShieldClient.watch_interval] == [1.0, 2.0, 4.0]
     await c.stop()
 
 
@@ -137,8 +138,13 @@ def test_snapshot_before_connecting(settings):
     snap = ShieldClient(settings).snapshot()
     assert snap == {
         "host": "192.0.2.10",
+        "name": None,
         "paired": True,
+        "dry_run": False,
         "reachable": False,
+        "stale": False,  # nothing known yet, so nothing stale
+        "as_of": None,
+        "error": None,
         "power": None,
         "current_app_package": None,
         "current_app": None,

@@ -56,5 +56,5 @@ files = ["src"]
 strict = true
 
 [[tool.mypy.overrides]]
-module = ["adb_shell.*"]  # ships no type hints
+module = ["adb_shell.*", "google.protobuf.*"]  # ship no type hints (protobuf's stubs are a separate package)
 ignore_missing_imports = true

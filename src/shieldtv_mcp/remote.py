@@ -264,15 +264,36 @@ def transport_security(cfg: HttpConfig) -> TransportSecuritySettings:
 
     cloudflared passes the public Host through, so the public hostname must be
     allowed; so are loopback and the bind address, for local checks.
+
+    The checks stay on even when binding to every interface (0.0.0.0 or ::)
+    with no --public-host. That combination is the one where they matter
+    most: with --insecure-no-auth, a web page open in any browser on the LAN
+    could otherwise reach the server through a rebinding hostname. LAN
+    clients then need their address of this machine passed as --public-host.
     """
-    hosts = ["127.0.0.1:*", "localhost:*", "[::1]:*", *cfg.public_hosts]
+    hosts = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
+    for h in cfg.public_hosts:
+        # A hostname as Cloudflare sends it (no port), or a LAN IP on any port
+        hosts.append(f"{h}:*" if _is_ip(h) else h)
     if cfg.bind not in ("0.0.0.0", "::"):
-        hosts.append(f"{cfg.bind}:*")
+        hosts.append(f"[{cfg.bind}]:*" if ":" in cfg.bind else f"{cfg.bind}:*")
     elif not cfg.public_hosts:
-        log.warning("Binding to %s with no --public-host: Host header checks are off.", cfg.bind)
-        return TransportSecuritySettings(enable_dns_rebinding_protection=False)
+        log.warning(
+            "Binding to %s with no --public-host: only loopback Host headers are accepted. Pass "
+            "--public-host <this machine's LAN address> for clients on the LAN.",
+            cfg.bind,
+        )
     origins = [f"https://{h}" for h in cfg.public_hosts] + ["http://127.0.0.1:*", "http://localhost:*"]
+    origins += [f"http://{h}:*" for h in cfg.public_hosts if _is_ip(h)]  # plain-HTTP LAN testing
     return TransportSecuritySettings(enable_dns_rebinding_protection=True, allowed_hosts=hosts, allowed_origins=origins)
+
+
+def _is_ip(text: str) -> bool:
+    try:
+        ipaddress.ip_address(text.strip("[]"))
+        return True
+    except ValueError:
+        return False
 
 
 def build_app(mcp: MCPServer, cfg: HttpConfig, verifier: AccessVerifier | None = None) -> ASGIApp:
@@ -295,4 +316,9 @@ def serve_http(mcp: MCPServer, cfg: HttpConfig) -> None:
         log.warning("Serving %s on %s:%s WITHOUT Cloudflare Access checks.", cfg.path, cfg.bind, cfg.port)
     else:
         log.info("Serving %s on %s:%s; requests need a %s assertion.", cfg.path, cfg.bind, cfg.port, cfg.access.issuer)
-    uvicorn.run(app, host=cfg.bind, port=cfg.port, log_level="info", proxy_headers=False, lifespan="on")
+    # log_config=None: uvicorn's own log lines (access logs carry client
+    # addresses) go through the root logger, so the server's redacting
+    # handler (logsafe.py) formats them, instead of uvicorn's plain one.
+    uvicorn.run(
+        app, host=cfg.bind, port=cfg.port, log_level="info", log_config=None, proxy_headers=False, lifespan="on"
+    )
