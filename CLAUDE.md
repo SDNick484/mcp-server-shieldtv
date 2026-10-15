@@ -11,16 +11,31 @@ explain the reasoning behind non-obvious changes instead of only making them.
 
 ## Layout
 
-- `src/shieldtv_mcp/config.py`: settings, file locations, and the key and app allow-lists
-- `src/shieldtv_mcp/client.py`: `ShieldClient`, the long-lived connection plus pushed-state cache
-- `src/shieldtv_mcp/server.py`: MCP tools (`MCPServer` from `mcp` 2.x)
+- `src/shieldtv_mcp/config.py`: settings, file locations, and the key and app allow-lists;
+  loading never raises (problems go to `Settings.problems`)
+- `src/shieldtv_mcp/client.py`: `ShieldClient`, the long-lived connection plus pushed-state
+  cache, and its watchdog (re-pair pickup, rediscovery by MAC)
+- `src/shieldtv_mcp/server.py`: MCP tools (`MCPServer` from `mcp` 2.x), `ActionResult`, then
+  resources (`shieldtv://...`) and prompts
 - `src/shieldtv_mcp/adb.py`: optional ADB: constant `COMMANDS`, their parsers, and the reboot flow
-- `src/shieldtv_mcp/cli.py`: `serve` (default), `pair`, `discover`, `adb-setup`
+- `src/shieldtv_mcp/assumptions.py`: every protocol detail relied on (S-* ids), with whether a
+  real Shield confirmed it. Cite ids in code (`ASSUMPTION S-...`); `tests/test_assumptions.py`
+  keeps code, README and HARDWARE_VALIDATION.md in step with it
+- `src/shieldtv_mcp/cli.py`: `serve` (default), `pair`, `discover`, `adb-setup`, `doctor`
+  (`doctor.py`), `simulate`, `call`
+- `src/shieldtv_mcp/remote.py`, `logsafe.py`: Streamable HTTP behind Cloudflare Access, and log
+  redaction. Shared, byte-identical, with mcp-server-onkyo, -harmony and -sofabaton: change
+  them in all four
 - `src/shieldtv_mcp/discovery.py`: mDNS lookup for `_androidtvremote2._tcp`
-- `tests/`: `conftest.py` (`FakeRemote`, which mirrors the library's real data shapes),
-  `test_config`, `test_client`, `test_adb` (parser fed real dumpsys output, `FakeDevice`),
-  `test_tools` (in-process MCP `Client`), `test_stdio`
-  (installed entry point). Async tests use anyio's plugin, not pytest-asyncio.
+- `src/shieldtv_mcp/sim/fake_shield.py`: a simulated Shield on the wire (TLS, pairing and the
+  remote session), with `Faults`; the real library runs against it
+- `deploy/alpine/`: OpenRC service, install script, and the container smoke test CI runs
+- `docs/ADB_TOOLS.md`: review of the ADB tools and proposed read-only ones (design only)
+- `tests/`: `conftest.py` (`FakeRemote`, which mirrors the library's real data shapes, and the
+  simulated-Shield fixtures `home`, `shield`, `paired`), `test_wire` (library vs simulator),
+  `test_client`, `test_tools`, `test_resources`, `test_adb` (parsers fed real dumpsys output,
+  `FakeDevice`), `test_tooling`, `test_http_tools`, `test_stdio`. Async tests use anyio's
+  plugin, not pytest-asyncio.
 
 ## Rules for changes
 
@@ -41,10 +56,18 @@ explain the reasoning behind non-obvious changes instead of only making them.
   microphone, `VOLUME_MUTE` the sound.
 - Every tool has a `title`, explicit `ToolAnnotations`, and constrained args via
   `Literal`/`Annotated[..., Field(...)]`. `test_tools.py` enforces this.
+- Actions return `ActionResult` and honor dry run (`settings.dry_run`: return before sending;
+  `ShieldClient._run` asserts it as a backstop).
+- **Don't invent protocol details.** Anything not seen on a Shield goes in `assumptions.py`
+  (simulator-only), is cited where the code relies on it, and gets a step in
+  HARDWARE_VALIDATION.md. The simulator names the source of each behavior it implements.
+- **Never guess a device.** Rediscovery adopts a new address only when its certificate shows
+  the MAC `pair` saved.
 
 ## Status
 
-Verified on a real Shield (remote service 7.00, 2026-10): pair, `get_status`, keys,
+Everything added on the `hardware-free` branch is simulator-only until HARDWARE_VALIDATION.md
+is run. Verified on a real Shield (remote service 7.00, 2026-10): pair, `get_status`, keys,
 `launch_app`, `set_power` (`SLEEP` reports `standby` at once; any key, not just
 `WAKEUP`, wakes it), `adb-setup`, `get_now_playing` and `get_remotes`.
 
@@ -80,5 +103,7 @@ Hardware facts the code depends on (the library hides them):
 
 ```sh
 pip install -e ".[dev]" && pytest && ruff check . && ruff format --check . && mypy
-mcp-server-shieldtv discover | pair [--host IP] | adb-setup | (serve)
+mcp-server-shieldtv discover | pair [--host IP] | adb-setup | doctor | (serve [--http] [--dry-run])
+mcp-server-shieldtv simulate --config-dir /tmp/sim [--paired]   # then SHIELDTV_CONFIG_DIR=/tmp/sim ...
+mcp-server-shieldtv call <tool> key=value                         # one tool through the MCP layer
 ```

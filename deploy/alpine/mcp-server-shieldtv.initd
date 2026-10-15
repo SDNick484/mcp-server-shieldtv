@@ -1,0 +1,31 @@
+#!/sbin/openrc-run
+# OpenRC service for mcp-server-shieldtv (Streamable HTTP), e.g. in an Alpine LXC.
+# Installed as /etc/init.d/mcp-server-shieldtv by install.sh. HTTP and Cloudflare
+# Access settings live in /etc/mcp-server-shieldtv/env; the pairing credentials
+# and config.json in /var/lib/mcp-server-shieldtv (the service user's own, 0700,
+# since the server rewrites config.json when the Shield's address changes).
+
+name="mcp-server-shieldtv"
+description="MCP server for an NVIDIA Shield TV, over Streamable HTTP"
+
+# supervise-daemon restarts the server if it exits (respawn_* below).
+supervisor="supervise-daemon"
+# run.sh loads /etc/mcp-server-shieldtv/env, then execs `mcp-server-shieldtv serve --http`.
+command="/opt/mcp-server-shieldtv/run.sh"
+command_user="mcp-shieldtv:mcp-shieldtv"
+directory="/var/lib/mcp-server-shieldtv"
+output_log="/var/log/mcp-server-shieldtv/server.log"
+error_log="/var/log/mcp-server-shieldtv/server.log"
+respawn_delay=5
+respawn_max=10
+respawn_period=300
+
+depend() {
+	need net
+	after firewall
+}
+
+start_pre() {
+	checkpath --directory --mode 0750 --owner mcp-shieldtv:mcp-shieldtv /var/log/mcp-server-shieldtv
+	checkpath --directory --mode 0700 --owner mcp-shieldtv:mcp-shieldtv /var/lib/mcp-server-shieldtv
+}

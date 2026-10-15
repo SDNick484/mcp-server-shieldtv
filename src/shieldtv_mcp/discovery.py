@@ -1,4 +1,4 @@
-"""Find Android TV devices on the LAN via mDNS (_androidtvremote2._tcp)."""
+"""Find Android TV devices on the LAN via mDNS (_androidtvremote2._tcp). ASSUMPTION S-MDNS."""
 
 from __future__ import annotations
 
