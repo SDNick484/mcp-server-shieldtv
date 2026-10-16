@@ -21,6 +21,14 @@ STEP='install'
 apk add --no-cache openrc curl >/dev/null
 sh deploy/alpine/install.sh /src
 
+STEP='upgrade'
+# Re-running install.sh must replace the code even though the version number hasn't changed
+# (pip would otherwise keep the installed copy). Install a copy with a marker, then look for it.
+cp -r /src /tmp/src2
+echo '# smoke-test upgrade marker' >>/tmp/src2/src/shieldtv_mcp/__init__.py
+sh /tmp/src2/deploy/alpine/install.sh /tmp/src2
+grep -q 'smoke-test upgrade marker' /opt/mcp-server-shieldtv/venv/lib/python3*/site-packages/shieldtv_mcp/__init__.py
+
 STEP='pytest on musl'
 # The full test suite on musl, from the installed venv
 /opt/mcp-server-shieldtv/venv/bin/pip install --quiet "/src[dev]"
