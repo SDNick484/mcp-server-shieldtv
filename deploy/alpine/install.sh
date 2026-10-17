@@ -39,6 +39,10 @@ fi
 python3 -m venv "$PREFIX/venv"
 "$PREFIX/venv/bin/pip" install --quiet --upgrade pip
 "$PREFIX/venv/bin/pip" install --quiet --upgrade "$SRC"
+# Every commit carries the same version number, so pip calls an installed copy "already satisfied"
+# and keeps it: re-running this script would upgrade nothing. Reinstall the package itself (not its
+# dependencies) so it always gets the code from SOURCE.
+"$PREFIX/venv/bin/pip" install --quiet --force-reinstall --no-deps "$SRC"
 install -m 0755 "$HERE/run.sh" "$PREFIX/run.sh"
 
 install -d -m 0750 -o root -g "$USER_NAME" "$ETC"
