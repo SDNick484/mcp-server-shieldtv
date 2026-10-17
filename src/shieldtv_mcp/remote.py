@@ -1,7 +1,7 @@
 """Serve an MCP server over Streamable HTTP, behind Cloudflare Access.
 
-This file is shared, identical, by the sibling servers (mcp-server-onkyo,
--shieldtv, -harmony, -sofabaton). Change it in one, copy it to the others.
+Shared by the sibling servers, byte for byte. Change it in mcp-server-shared,
+not in a copy, then sync (`python scripts/sync_shared.py --update`).
 
 Why HTTP: stdio means the MCP client launches the server on its own machine.
 To use one server from Claude Code, Claude Desktop and the mobile app, it has
@@ -23,6 +23,15 @@ What it deliberately doesn't do: run its own OAuth server, or answer 401 with
 that an origin doing its own OAuth conflicts with Managed OAuth. A request
 without a valid assertion gets a plain 403.
 
+Without Access, the server is meant for this machine only (Claude Code or
+Desktop on the same box, a local test). Binding to 127.0.0.1 isn't enough to
+guarantee that: a tunnel or reverse proxy running here reaches the port from
+loopback too, and would carry anyone's request in. So with no Access and no
+--insecure-no-auth, two more things are refused: a --public-host (a public
+name only makes sense behind a tunnel or proxy) at startup, and, per request,
+anything carrying a proxy's forwarding headers (Cloudflare adds
+Cf-Connecting-IP and Cf-Ray, most proxies X-Forwarded-For or Forwarded).
+
 Settings come from flags or the environment (flags win):
 
     --http                 serve HTTP instead of stdio
@@ -33,7 +42,7 @@ Settings come from flags or the environment (flags win):
     CF_ACCESS_TEAM_DOMAIN          e.g. example.cloudflareaccess.com
     CF_ACCESS_AUD                  the Access application's audience tag(s), comma-separated
     MCP_ALLOWED_EMAILS             optional, comma-separated
-    --insecure-no-auth     allow a non-loopback bind without Access (LAN testing only)
+    --insecure-no-auth     serve without Access beyond this machine (trusted-LAN testing only)
 """
 
 from __future__ import annotations
@@ -57,6 +66,8 @@ log = logging.getLogger(__name__)
 
 ACCESS_HEADER = "cf-access-jwt-assertion"
 HEALTH_PATH = "/healthz"
+# Headers a proxy adds to what it forwards. A request with one didn't start on this machine.
+FORWARDED_HEADERS = ("forwarded", "x-forwarded-for", "x-real-ip", "cf-connecting-ip", "cf-ray")
 
 
 class ConfigError(ValueError):
@@ -98,6 +109,11 @@ class HttpConfig:
     insecure_no_auth: bool = False
 
     @property
+    def local_only(self) -> bool:
+        """No auth, so only requests that start on this machine may be served (see the module docstring)."""
+        return self.access is None and not self.insecure_no_auth
+
+    @property
     def loopback(self) -> bool:
         if self.bind == "localhost":
             return True
@@ -116,6 +132,13 @@ class HttpConfig:
             raise ConfigError(
                 f"Refusing to serve on {self.bind} without Cloudflare Access: anyone who can reach this port could "
                 "control your devices. Set CF_ACCESS_TEAM_DOMAIN and CF_ACCESS_AUD, bind to 127.0.0.1, or pass "
+                "--insecure-no-auth for a trusted-LAN test."
+            )
+        if self.public_hosts and self.local_only:
+            raise ConfigError(
+                f"Refusing --public-host {', '.join(self.public_hosts)} without Cloudflare Access: requests for a "
+                "public name come through a tunnel or reverse proxy, which reaches this port from loopback, so "
+                "binding to 127.0.0.1 doesn't keep them out. Set CF_ACCESS_TEAM_DOMAIN and CF_ACCESS_AUD, or pass "
                 "--insecure-no-auth for a trusted-LAN test."
             )
 
@@ -137,7 +160,7 @@ def add_http_arguments(parser: argparse.ArgumentParser, *, default_port: int, de
     g.add_argument(
         "--insecure-no-auth",
         action="store_true",
-        help="allow a non-loopback bind without Cloudflare Access (trusted LAN testing only)",
+        help="serve without Cloudflare Access beyond this machine (trusted-LAN testing only)",
     )
     parser.set_defaults(_http_default_port=default_port, _http_default_path=default_path)
 
@@ -230,11 +253,14 @@ class AccessMiddleware:
 
     Lifespan events pass untouched (the MCP session manager starts there), and
     the health check is answered before auth so a local monitor can use it.
+    With no verifier and ``local_only``, a request a proxy forwarded is refused
+    instead (see the module docstring).
     """
 
-    def __init__(self, app: ASGIApp, verifier: AccessVerifier | None) -> None:
+    def __init__(self, app: ASGIApp, verifier: AccessVerifier | None, *, local_only: bool = False) -> None:
         self.app = app
         self.verifier = verifier
+        self.local_only = local_only
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -243,8 +269,22 @@ class AccessMiddleware:
         if scope["path"] == HEALTH_PATH:
             await _plain(send, 200, {"status": "ok"})
             return
+        headers = dict(scope.get("headers") or [])
+        if self.verifier is None and self.local_only:
+            forwarded = [h for h in FORWARDED_HEADERS if h.encode() in headers]
+            if forwarded:
+                client = scope.get("client") or ("?", 0)
+                log.warning(
+                    "Denied %s %s from %s: forwarded by a proxy (%s), and without Cloudflare Access this server only "
+                    "serves requests from this machine. Set CF_ACCESS_TEAM_DOMAIN and CF_ACCESS_AUD.",
+                    scope.get("method"),
+                    scope["path"],
+                    client[0],
+                    ", ".join(forwarded),
+                )
+                await _plain(send, 403, {"error": "forbidden"})
+                return
         if self.verifier is not None:
-            headers = dict(scope.get("headers") or [])
             token = headers.get(ACCESS_HEADER.encode(), b"").decode()
             try:
                 if not token:
@@ -304,7 +344,7 @@ def build_app(mcp: MCPServer, cfg: HttpConfig, verifier: AccessVerifier | None =
     app = mcp.streamable_http_app(
         streamable_http_path=cfg.path, transport_security=transport_security(cfg), host=cfg.bind
     )
-    return AccessMiddleware(app, verifier)
+    return AccessMiddleware(app, verifier, local_only=cfg.local_only)
 
 
 def serve_http(mcp: MCPServer, cfg: HttpConfig) -> None:

@@ -1,7 +1,8 @@
 """The HTTP transport and the Cloudflare Access check.
 
-Shared by the sibling servers along with remote.py; only the import below
-differs between repos. The end-to-end tests run a real uvicorn server on a
+Shared by the sibling servers along with remote.py; only the package name in
+the import below differs between repos. Change it in mcp-server-shared, not in
+a copy, then sync. The end-to-end tests run a real uvicorn server on a
 free port and talk MCP to it over HTTP, signing Access assertions with a
 throwaway RSA key, so nothing here needs Cloudflare.
 """
@@ -31,7 +32,7 @@ KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 
 def token(**overrides: object) -> str:
     now = int(time.time())
-    claims = {"iss": f"https://{TEAM}", "aud": [AUD], "iat": now, "exp": now + 300, "email": "nick@example.com"}
+    claims = {"iss": f"https://{TEAM}", "aud": [AUD], "iat": now, "exp": now + 300, "email": "user@example.com"}
     claims.update(overrides)
     return jwt.encode({k: v for k, v in claims.items() if v is not None}, KEY, algorithm="RS256")
 
@@ -63,11 +64,11 @@ def test_environment_then_flags():
         "MCP_PUBLIC_HOSTS": "mcp.example.com",
         "CF_ACCESS_TEAM_DOMAIN": f"https://{TEAM}/",
         "CF_ACCESS_AUD": f"{AUD}, other",
-        "MCP_ALLOWED_EMAILS": "Nick@Example.com",
+        "MCP_ALLOWED_EMAILS": "User@Example.com",
     }
     cfg = parse([], env)
     assert (cfg.bind, cfg.port, cfg.public_hosts) == ("10.0.0.5", 9000, ("mcp.example.com",))
-    assert cfg.access == remote.AccessPolicy(TEAM, (AUD, "other"), frozenset({"nick@example.com"}))
+    assert cfg.access == remote.AccessPolicy(TEAM, (AUD, "other"), frozenset({"user@example.com"}))
     assert parse(["--port", "9100", "--bind", "127.0.0.1"], env).port == 9100
 
 
@@ -78,6 +79,9 @@ def test_environment_then_flags():
         (["--path", "mcp"], {}, "must start with '/'"),
         (["--path", "/healthz"], {}, "can't be /healthz"),
         ([], {"CF_ACCESS_TEAM_DOMAIN": TEAM}, "CF_ACCESS_AUD is empty"),
+        # A public name means a tunnel or proxy, which reaches a loopback bind too.
+        (["--public-host", "mcp.example.com"], {}, "Refusing --public-host mcp.example.com without Cloudflare Access"),
+        ([], {"MCP_PUBLIC_HOSTS": "mcp.example.com"}, "Refusing --public-host"),
     ],
 )
 def test_unsafe_or_incomplete_settings_are_refused(argv, env, message):
@@ -87,13 +91,18 @@ def test_unsafe_or_incomplete_settings_are_refused(argv, env, message):
 
 def test_insecure_flag_is_an_explicit_opt_out():
     parse(["--bind", "0.0.0.0", "--insecure-no-auth"]).check()
+    parse(["--bind", "0.0.0.0", "--public-host", "192.168.1.10", "--insecure-no-auth"]).check()
+
+
+def test_a_public_host_is_fine_with_access():
+    parse(["--public-host", "mcp.example.com"], {"CF_ACCESS_TEAM_DOMAIN": TEAM, "CF_ACCESS_AUD": AUD}).check()
 
 
 # --- the verifier ---------------------------------------------------------------
 @pytest.mark.anyio
 async def test_valid_assertion():
     claims = await remote.AccessVerifier(POLICY, public_key).verify(token())
-    assert claims["email"] == "nick@example.com"
+    assert claims["email"] == "user@example.com"
 
 
 @pytest.mark.anyio
@@ -128,8 +137,8 @@ async def test_unsigned_tokens_are_denied():
 
 @pytest.mark.anyio
 async def test_email_allow_list():
-    policy = remote.AccessPolicy(TEAM, (AUD,), frozenset({"nick@example.com"}))
-    await remote.AccessVerifier(policy, public_key).verify(token(email="NICK@example.com"))
+    policy = remote.AccessPolicy(TEAM, (AUD,), frozenset({"user@example.com"}))
+    await remote.AccessVerifier(policy, public_key).verify(token(email="USER@example.com"))
     with pytest.raises(remote.AccessDenied, match="not in MCP_ALLOWED_EMAILS"):
         await remote.AccessVerifier(policy, public_key).verify(token(email="guest@example.com"))
 
@@ -158,7 +167,8 @@ async def running(cfg: remote.HttpConfig, starts: list[int]):
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
     port = sock.getsockname()[1]
-    app = remote.build_app(tiny_server(starts), cfg, remote.AccessVerifier(POLICY, public_key))
+    verifier = remote.AccessVerifier(POLICY, public_key) if cfg.access else None
+    app = remote.build_app(tiny_server(starts), cfg, verifier)
     server = uvicorn.Server(uvicorn.Config(app, log_level="warning", lifespan="on"))
     async with anyio.create_task_group() as tg:
         tg.start_soon(server.serve, [sock])
@@ -222,3 +232,38 @@ async def test_wildcard_bind_keeps_host_checks_on():
     assert "127.0.0.1:*" in sec.allowed_hosts and not any("evil" in h for h in sec.allowed_hosts)
     lan = remote.transport_security(remote.HttpConfig(bind="0.0.0.0", public_hosts=("192.168.1.10",)))
     assert "192.168.1.10:*" in lan.allowed_hosts and "http://192.168.1.10:*" in lan.allowed_origins
+
+
+# --- no Access: this machine only ----------------------------------------------------
+LOCAL = remote.HttpConfig(path="/thing/mcp")  # loopback, no Access, no --insecure-no-auth
+
+
+@pytest.mark.anyio
+async def test_without_access_local_requests_work():
+    async with running(LOCAL, []) as base, mcp_client(f"{base}/thing/mcp", {}) as c:
+        assert (await c.call_tool("ping", {})).content[0].text == "pong"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "header",
+    [
+        {"cf-connecting-ip": "203.0.113.7", "cf-ray": "8a1b2c3d4e5f-SJC"},  # through a Cloudflare Tunnel
+        {"x-forwarded-for": "203.0.113.7"},  # nginx, Caddy, Traefik, ...
+        {"forwarded": "for=203.0.113.7"},  # RFC 7239
+    ],
+)
+async def test_without_access_forwarded_requests_get_403(header):
+    # A tunnel to 127.0.0.1 with the tunnel's Host header rewritten to localhost gets past the
+    # bind and the Host check; the proxy's own headers still give it away.
+    async with running(LOCAL, []) as base, httpx2.AsyncClient() as http:
+        body = {"jsonrpc": "2.0", "id": 1, "method": "ping"}
+        resp = await http.post(f"{base}/thing/mcp", json=body, headers=header)
+        assert resp.status_code == 403 and resp.json() == {"error": "forbidden"}
+
+
+@pytest.mark.anyio
+async def test_insecure_no_auth_serves_forwarded_requests_too():
+    cfg = remote.HttpConfig(path="/thing/mcp", insecure_no_auth=True)
+    async with running(cfg, []) as base, mcp_client(f"{base}/thing/mcp", {"x-forwarded-for": "192.168.1.20"}) as c:
+        assert (await c.call_tool("ping", {})).content[0].text == "pong"

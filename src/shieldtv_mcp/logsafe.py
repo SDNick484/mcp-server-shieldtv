@@ -1,7 +1,7 @@
 """Log redaction: keep secrets, LAN addresses and MACs out of logs you might paste into an issue.
 
-Shared, byte-identical, by the sibling servers (mcp-server-onkyo, -shieldtv,
--harmony, -sofabaton). Change it in one, copy it to the others.
+Shared by the sibling servers, byte for byte. Change it in mcp-server-shared,
+not in a copy, then sync (`python scripts/sync_shared.py --update`).
 
 Logs mention devices by name wherever we control the message, but libraries
 log addresses freely, and tracebacks carry URLs and headers. So instead of

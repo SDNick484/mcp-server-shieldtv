@@ -23,9 +23,13 @@ explain the reasoning behind non-obvious changes instead of only making them.
   keeps code, README and HARDWARE_VALIDATION.md in step with it
 - `src/shieldtv_mcp/cli.py`: `serve` (default), `pair`, `discover`, `adb-setup`, `doctor`
   (`doctor.py`), `simulate`, `call`
-- `src/shieldtv_mcp/remote.py`, `logsafe.py`: Streamable HTTP behind Cloudflare Access, and log
-  redaction. Shared, byte-identical, with mcp-server-onkyo, -harmony and -sofabaton: change
-  them in all four
+- **Shared with the siblings; the source of truth is mcp-server-shared.** `src/shieldtv_mcp/remote.py`
+  (Streamable HTTP behind Cloudflare Access), `logsafe.py` (log redaction), `tasks.py`, `ratelimit.py`,
+  `scripts/sync_shared.py`, and `tests/test_remote.py`, `test_logsafe.py`, `test_tasks.py`,
+  `test_ratelimit.py` (rendered with this package's name); mcp-server-shared's `shared.toml` is the
+  full list. Don't edit them here: change them in mcp-server-shared, then run
+  `python scripts/sync_shared.py --update` here and commit the files together with `shared.lock`.
+  CI's `shared-drift` job fails on any difference from the locked commit
 - `src/shieldtv_mcp/discovery.py`: mDNS lookup for `_androidtvremote2._tcp`
 - `src/shieldtv_mcp/sim/fake_shield.py`: a simulated Shield on the wire (TLS, pairing and the
   remote session), with `Faults`; the real library runs against it
