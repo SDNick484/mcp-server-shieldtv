@@ -1,0 +1,7 @@
+# Which mcp-server-shared commit this repo's shared files come from, and this
+# repo's package name (it replaces __PKG__). Written by
+# `python scripts/sync_shared.py --update`; see that script. An optional
+# `exclude = ["remote"]` names shared modules this repo doesn't take.
+repo = "SDNick484/mcp-server-shared"
+commit = "46275869c7177486ca5d6cc3cdcc51af49971507"
+package = "shieldtv_mcp"

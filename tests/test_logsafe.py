@@ -1,4 +1,9 @@
-"""Log redaction (logsafe.py is shared with the sibling servers)."""
+"""Log redaction.
+
+Shared by the sibling servers along with logsafe.py; only the package name in
+the import below differs between repos. Change it in mcp-server-shared, not in
+a copy, then sync.
+"""
 
 from __future__ import annotations
 
@@ -16,9 +21,9 @@ def test_addresses_and_macs():
 
 
 def test_secrets_are_always_redacted():
-    line = f"cf-access-jwt-assertion: {JWT} Authorization: Bearer abcdef0123456789 mqtt://nick:hunter2@10.0.0.2"
+    line = f"cf-access-jwt-assertion: {JWT} Authorization: Bearer abcdef0123456789 mqtt://user:hunter2@10.0.0.2"
     assert redact_secrets(line) == (
-        "cf-access-jwt-assertion: [jwt redacted] Authorization: Bearer [redacted] mqtt://nick:***@10.0.0.2"
+        "cf-access-jwt-assertion: [jwt redacted] Authorization: Bearer [redacted] mqtt://user:***@10.0.0.2"
     )
     pem = "key:\n-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n-----END PRIVATE KEY-----\nok"
     assert redact_secrets(pem) == "key:\n[pem redacted]\nok"
