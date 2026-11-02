@@ -68,12 +68,12 @@ def client(url: str, assertion: str | None) -> Client:
 async def test_tools_work_over_http_with_a_valid_assertion(paired):
     async with serving() as url, client(url, token()) as c:
         for _ in range(100):  # the server connects to the Shield in the background
-            status = (await c.call_tool("get_status", {})).structured_content
+            status = (await c.call_tool("shield_get_status", {})).structured_content
             if status["reachable"]:
                 break
             await anyio.sleep(0.05)
         assert (status["name"], status["power"]) == ("SHIELD Android TV", "on")
-        result = (await c.call_tool("launch_app", {"app": "netflix"})).structured_content
+        result = (await c.call_tool("shield_launch_app", {"app": "netflix"})).structured_content
         assert result["outcome"] == "done"
     assert paired.launched == ["https://www.netflix.com/title"]
 
@@ -92,7 +92,7 @@ async def test_tools_work_over_http_with_a_valid_assertion(paired):
 async def test_bad_assertions_never_reach_the_shield(paired, assertion):
     async with serving() as url, httpx2.AsyncClient() as http:
         headers = {remote.ACCESS_HEADER: assertion} if assertion else {}
-        body = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "send_key"}}
+        body = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "shield_send_key"}}
         resp = await http.post(url, json=body, headers=headers)
         assert (resp.status_code, resp.json()) == (403, {"error": "forbidden"})
     assert paired.keys == [] and paired.launched == []

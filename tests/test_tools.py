@@ -44,14 +44,14 @@ def detail(result) -> str:
 # --- tools/list --------------------------------------------------------------
 async def test_tool_names(mcp_client):
     assert set(await tools(mcp_client)) == {
-        "get_status",
-        "get_now_playing",
-        "get_remotes",
-        "list_apps",
-        "send_key",
-        "launch_app",
-        "set_power",
-        "reboot_shield",
+        "shield_get_status",
+        "shield_get_now_playing",
+        "shield_get_remotes",
+        "shield_list_apps",
+        "shield_send_key",
+        "shield_launch_app",
+        "shield_set_power",
+        "shield_reboot",
     }
 
 
@@ -66,52 +66,52 @@ async def test_every_tool_has_title_description_and_annotations(mcp_client):
         assert a.read_only_hint is not None and a.open_world_hint is False, t.name
         if not a.read_only_hint:
             # Only a reboot is disruptive enough for clients to confirm first.
-            assert a.destructive_hint is (t.name == "reboot_shield") and a.idempotent_hint is not None, t.name
+            assert a.destructive_hint is (t.name == "shield_reboot") and a.idempotent_hint is not None, t.name
 
 
 async def test_annotations_match_behavior(mcp_client):
     t = await tools(mcp_client)
-    assert t["get_status"].annotations.read_only_hint is True
-    assert t["list_apps"].annotations.read_only_hint is True
-    assert t["get_now_playing"].annotations.read_only_hint is True
-    assert t["get_remotes"].annotations.read_only_hint is True
-    assert t["reboot_shield"].annotations.destructive_hint is True  # interrupts playback
-    assert t["send_key"].annotations.idempotent_hint is False  # DPAD_DOWN twice moves twice
-    assert t["launch_app"].annotations.idempotent_hint is True
-    assert t["set_power"].annotations.idempotent_hint is True  # WAKEUP/SLEEP, not a toggle
+    assert t["shield_get_status"].annotations.read_only_hint is True
+    assert t["shield_list_apps"].annotations.read_only_hint is True
+    assert t["shield_get_now_playing"].annotations.read_only_hint is True
+    assert t["shield_get_remotes"].annotations.read_only_hint is True
+    assert t["shield_reboot"].annotations.destructive_hint is True  # interrupts playback
+    assert t["shield_send_key"].annotations.idempotent_hint is False  # DPAD_DOWN twice moves twice
+    assert t["shield_launch_app"].annotations.idempotent_hint is True
+    assert t["shield_set_power"].annotations.idempotent_hint is True  # WAKEUP/SLEEP, not a toggle
 
 
 async def test_send_key_schema(mcp_client):
-    props = (await tools(mcp_client))["send_key"].input_schema["properties"]
+    props = (await tools(mcp_client))["shield_send_key"].input_schema["properties"]
     # Literal[...] becomes a JSON Schema enum: the model can only pick from it.
     assert set(props["key"]["enum"]) == ALLOWED_KEYS
     assert (props["repeat"]["minimum"], props["repeat"]["maximum"], props["repeat"]["default"]) == (1, 10, 1)
 
 
 async def test_set_power_schema(mcp_client):
-    props = (await tools(mcp_client))["set_power"].input_schema["properties"]
+    props = (await tools(mcp_client))["shield_set_power"].input_schema["properties"]
     assert set(props["state"]["enum"]) == {"on", "off"}
 
 
-@pytest.mark.parametrize("name", ["get_now_playing", "get_remotes", "reboot_shield"])
+@pytest.mark.parametrize("name", ["shield_get_now_playing", "shield_get_remotes", "shield_reboot"])
 async def test_adb_tools_take_no_arguments(mcp_client, name):
     # They run commands over ADB, so nothing the model writes may reach them.
     assert not (await tools(mcp_client))[name].input_schema.get("properties")
 
 
 async def test_get_now_playing_output_schema(mcp_client):
-    t = (await tools(mcp_client))["get_now_playing"]
+    t = (await tools(mcp_client))["shield_get_now_playing"]
     assert set(t.output_schema["required"]) == {"state", "app_package", "app", "title", "subtitle", "position_s"}
 
 
 async def test_get_now_playing_without_adb_says_how_to_enable(mcp_client):
-    result = await mcp_client.call_tool("get_now_playing", {})
+    result = await mcp_client.call_tool("shield_get_now_playing", {})
     assert result.is_error
     assert "mcp-server-shieldtv adb-setup" in text(result)
 
 
 async def test_get_status_publishes_output_schema(mcp_client):
-    schema = (await tools(mcp_client))["get_status"].output_schema
+    schema = (await tools(mcp_client))["shield_get_status"].output_schema
     assert set(schema["required"]) == {
         "host",
         "name",
@@ -131,7 +131,7 @@ async def test_get_status_publishes_output_schema(mcp_client):
 
 # --- tools/call --------------------------------------------------------------
 async def test_get_status(mcp_client):
-    result = await mcp_client.call_tool("get_status", {})
+    result = await mcp_client.call_tool("shield_get_status", {})
     assert not result.is_error
     status = result.structured_content
     assert status.pop("as_of").endswith("+00:00")  # when the values arrived, UTC
@@ -152,13 +152,13 @@ async def test_get_status(mcp_client):
 
 
 async def test_list_apps(mcp_client):
-    apps = (await mcp_client.call_tool("list_apps", {})).structured_content
+    apps = (await mcp_client.call_tool("shield_list_apps", {})).structured_content
     assert apps["netflix"] == "https://www.netflix.com/title"
     assert apps["mine"] == "com.example.mine"
 
 
 async def test_send_key_repeat(mcp_client, fake):
-    result = await mcp_client.call_tool("send_key", {"key": "DPAD_DOWN", "repeat": 3})
+    result = await mcp_client.call_tool("shield_send_key", {"key": "DPAD_DOWN", "repeat": 3})
     assert result.structured_content == {
         "shield": "192.0.2.10",
         "outcome": "done",
@@ -173,14 +173,14 @@ async def test_send_key_repeat(mcp_client, fake):
     "args", [{"key": "POWER"}, {"key": "text:hi"}, {"key": "HOME", "repeat": 11}, {"key": "HOME", "repeat": 0}]
 )
 async def test_send_key_rejects_bad_args_before_the_shield(mcp_client, fake, args):
-    result = await mcp_client.call_tool("send_key", args)
+    result = await mcp_client.call_tool("shield_send_key", args)
     assert result.is_error
     assert fake.keys == []
 
 
 async def test_launch_app(mcp_client, fake):
     fake.launch_outcomes["https://www.youtube.com"] = "com.google.android.youtube.tv"
-    result = await mcp_client.call_tool("launch_app", {"app": " YouTube "})
+    result = await mcp_client.call_tool("shield_launch_app", {"app": " YouTube "})
     assert detail(result) == "Launched youtube (com.google.android.youtube.tv is in the foreground)"
     assert result.structured_content["sent"] == ["app_link https://www.youtube.com"]
     assert fake.launched == ["https://www.youtube.com"]
@@ -188,27 +188,27 @@ async def test_launch_app(mcp_client, fake):
 
 async def test_failed_launch_tells_the_model_what_happened(mcp_client, fake):
     fake.launch_outcomes["https://www.youtube.com"] = "reject"
-    result = await mcp_client.call_tool("launch_app", {"app": "youtube"})
+    result = await mcp_client.call_tool("shield_launch_app", {"app": "youtube"})
     assert result.is_error
     assert "rejected the launch request" in text(result)
 
 
 async def test_launch_unknown_app_lists_known_ones(mcp_client, fake):
-    result = await mcp_client.call_tool("launch_app", {"app": "com.evil.app"})
+    result = await mcp_client.call_tool("shield_launch_app", {"app": "com.evil.app"})
     assert result.is_error
-    assert "Unknown app 'com.evil.app'. Known apps:" in text(result)
+    assert "Known apps has no 'com.evil.app'" in text(result)
     assert "netflix" in text(result)
     assert fake.launched == []  # raw package names are not a back door
 
 
 async def test_set_power(mcp_client, fake):
-    assert detail(await mcp_client.call_tool("set_power", {"state": "off"})) == "The Shield is in standby"
-    assert detail(await mcp_client.call_tool("set_power", {"state": "on"})) == "The Shield is on"
+    assert detail(await mcp_client.call_tool("shield_set_power", {"state": "off"})) == "The Shield is in standby"
+    assert detail(await mcp_client.call_tool("shield_set_power", {"state": "on"})) == "The Shield is on"
     assert fake.keys == ["SLEEP", "WAKEUP"]
 
 
 async def test_set_power_to_the_current_state_sends_nothing(mcp_client, fake):
-    result = (await mcp_client.call_tool("set_power", {"state": "on"})).structured_content
+    result = (await mcp_client.call_tool("shield_set_power", {"state": "on"})).structured_content
     assert (result["outcome"], result["detail"], result["sent"]) == ("unchanged", "The Shield is already on", [])
     assert fake.keys == []
 
@@ -226,9 +226,9 @@ async def dry_client(config_dir, fake, monkeypatch):
 @pytest.mark.parametrize(
     ("tool", "args", "sent"),
     [
-        ("send_key", {"key": "HOME", "repeat": 2}, ["KEYCODE_HOME", "KEYCODE_HOME"]),
-        ("launch_app", {"app": "youtube"}, ["app_link https://www.youtube.com"]),
-        ("set_power", {"state": "off"}, ["KEYCODE_SLEEP"]),
+        ("shield_send_key", {"key": "HOME", "repeat": 2}, ["KEYCODE_HOME", "KEYCODE_HOME"]),
+        ("shield_launch_app", {"app": "youtube"}, ["app_link https://www.youtube.com"]),
+        ("shield_set_power", {"state": "off"}, ["KEYCODE_SLEEP"]),
     ],
 )
 async def test_dry_run_reports_and_sends_nothing(dry_client, fake, tool, args, sent):
@@ -236,26 +236,26 @@ async def test_dry_run_reports_and_sends_nothing(dry_client, fake, tool, args, s
     assert result["outcome"] == "dry_run" and result["sent"] == sent
     assert result["detail"].startswith("DRY RUN, nothing sent: would ")
     assert (fake.keys, fake.launched) == ([], [])
-    assert (await dry_client.call_tool("get_status", {})).structured_content["dry_run"] is True
+    assert (await dry_client.call_tool("shield_get_status", {})).structured_content["dry_run"] is True
 
 
 async def test_dry_run_still_validates(dry_client, fake):
-    result = await dry_client.call_tool("launch_app", {"app": "com.evil.app"})
-    assert result.is_error and "Unknown app" in text(result)
-    result = await dry_client.call_tool("reboot_shield", {})
+    result = await dry_client.call_tool("shield_launch_app", {"app": "com.evil.app"})
+    assert result.is_error and "Known apps has no" in text(result)
+    result = await dry_client.call_tool("shield_reboot", {})
     assert result.is_error and "ADB isn't set up" in text(result)  # as the real call would
 
 
 async def test_dry_run_warns_when_the_real_call_would_fail(dry_client, fake):
     fake.push("is_available", False)
-    result = (await dry_client.call_tool("send_key", {"key": "HOME"})).structured_content
+    result = (await dry_client.call_tool("shield_send_key", {"key": "HOME"})).structured_content
     assert result["warnings"] == ["The Shield isn't reachable right now, so the real call would fail."]
 
 
 async def test_unreachable_shield_explains_itself(mcp_client, fake):
-    # The model must hear *why*, not just "Error executing tool send_key".
+    # The model must hear *why*, not just "Error executing tool shield_send_key".
     fake.push("is_available", False)
-    result = await mcp_client.call_tool("send_key", {"key": "HOME"})
+    result = await mcp_client.call_tool("shield_send_key", {"key": "HOME"})
     assert result.is_error
     assert "Can't reach the Shield at 192.0.2.10" in text(result)
 
@@ -264,7 +264,23 @@ async def test_unpaired_server_still_answers_status(config_dir, fake, monkeypatc
     (config_dir / "key.pem").unlink()
     monkeypatch.setattr(server, "ShieldClient", lambda s: ShieldClient(s, remote_factory=fake.build))
     async with Client(server.mcp) as c:
-        status = (await c.call_tool("get_status", {})).structured_content
+        status = (await c.call_tool("shield_get_status", {})).structured_content
         assert (status["paired"], status["reachable"]) == (False, False)
-        result = await c.call_tool("send_key", {"key": "HOME"})
+        result = await c.call_tool("shield_send_key", {"key": "HOME"})
         assert result.is_error and "mcp-server-shieldtv pair" in text(result)
+
+
+async def test_reboot_rate_limit_refusal(mcp_client):
+    # First reboot call takes the single token
+    res1 = await mcp_client.call_tool("shield_reboot", {})
+    # May fail with ADB isn't set up, but token was consumed
+    res2 = await mcp_client.call_tool("shield_reboot", {})
+    assert res2.is_error
+    assert "Rate limit on Shield TV" in text(res2)
+    assert "try again in" in text(res2)
+
+
+async def test_launch_app_fuzzy_suggestions(mcp_client, fake):
+    result = await mcp_client.call_tool("shield_launch_app", {"app": "netfli"})
+    assert result.is_error
+    assert "Closest matches: 'netflix'" in text(result)

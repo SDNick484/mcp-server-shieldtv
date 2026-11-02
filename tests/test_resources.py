@@ -50,12 +50,16 @@ async def test_keys_resource_matches_the_allow_list(c):
     assert not set(keys["left_out"]) & ALLOWED_KEYS
 
 
-TOOL_NAME = re.compile(r"\b(?:get|set|send|launch|list|reboot)_[a-z_]+\b")
+TOOL_NAME = re.compile(r"\bshield_(?:get_[a-z_]+|reboot|list_apps|send_key|launch_app|set_power)\b")
 
 
 @pytest.mark.parametrize(
     ("name", "args"),
-    [("watch", {"app": "netflix"}), ("watch", {"app": "plex", "what": "The Bear"}), ("remotes_not_working", {})],
+    [
+        ("shield_watch", {"app": "netflix"}),
+        ("shield_watch", {"app": "plex", "what": "The Bear"}),
+        ("shield_remotes_not_working", {}),
+    ],
 )
 async def test_prompts_only_name_tools_that_exist(c, name, args):
     tools = {t.name for t in (await c.list_tools()).tools}
@@ -66,4 +70,4 @@ async def test_prompts_only_name_tools_that_exist(c, name, args):
 
 async def test_watch_prompt_requires_an_app(c):
     prompts = {p.name: p for p in (await c.list_prompts()).prompts}
-    assert {a.name for a in prompts["watch"].arguments or [] if a.required} == {"app"}
+    assert {a.name for a in prompts["shield_watch"].arguments or [] if a.required} == {"app"}

@@ -212,7 +212,7 @@ def _pairing_failure(exc: BaseException) -> str:
 
 
 async def _cmd_adb_setup() -> int:
-    """Enable the optional ADB tools (get_now_playing, get_remotes, reboot_shield).
+    """Enable the optional ADB tools (shield_get_now_playing, shield_get_remotes, shield_reboot).
 
     1. Generate an ADB key pair (if missing), private to this config dir.
     2. Connect with it. An untrusted key makes the Shield ask "Allow USB
@@ -311,7 +311,7 @@ async def _cmd_simulate(args: argparse.Namespace) -> int:
     if not args.paired:
         print(f"  mcp-server-shieldtv pair --host {args.host}      # type the code shown here")
     print("  mcp-server-shieldtv doctor --no-mdns")
-    print("  mcp-server-shieldtv call get_status")
+    print("  mcp-server-shieldtv call shield_get_status")
     print("Ctrl+C to stop.", flush=True)
     try:
         await asyncio.Event().wait()

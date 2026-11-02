@@ -35,6 +35,9 @@ from .adb import (
 )
 from .client import ShieldClient, ShieldError, Status
 from .config import ALLOWED_KEYS, DEFAULT_APPS, KeyName, load_settings
+from .lookup import unknown_with_suggestions
+from .ratelimit import TokenBucket, refusal
+from .tools import ACT, ACT_IDEMPOTENT, DESTRUCTIVE, OPEN_WORLD_READ, READ_ONLY
 
 log = logging.getLogger(__name__)
 
@@ -42,6 +45,7 @@ log = logging.getLogger(__name__)
 # SDK calls, so they reach the shared connection through client(), not through
 # an argument. It is None outside the lifespan (e.g. when merely imported).
 _client: ShieldClient | None = None
+_REBOOT_BUCKET = TokenBucket(capacity=1.0, rate=1.0 / 120.0)
 
 
 def client() -> ShieldClient:
@@ -72,9 +76,10 @@ async def lifespan(_server: MCPServer) -> AsyncIterator[None]:
 mcp = MCPServer(
     "shieldtv",
     instructions=(
-        "Controls an NVIDIA Shield TV over the Android TV Remote protocol. "
-        "Call get_status first to see whether it is on and what app is in the foreground, "
-        "and get_now_playing for the title and play state. "
+        "Physical role: Media Source. Connects into Onkyo AVR input 'strm-box' (which routes video downstream "
+        "to the TV display and plays master audio). Controls an NVIDIA Shield TV over the Android TV Remote protocol. "
+        "Call shield_get_status first to see whether it is on and what app is in the foreground, "
+        "and shield_get_now_playing for the title and play state. "
         "The Shield must have been paired once with `mcp-server-shieldtv pair`."
     ),
     lifespan=lifespan,
@@ -82,23 +87,7 @@ mcp = MCPServer(
 
 # Tool annotations are behavioral hints sent in tools/list. Clients use them to
 # decide, e.g., whether to ask the user before a call. A tool without them is
-# assumed by the spec to be destructive, non-idempotent and open-world, so
-# every tool here states its hints explicitly:
-#   read_only_hint   - changes nothing (status, app list)
-#   destructive_hint - False: nothing here deletes data or is irreversible
-#   idempotent_hint  - calling twice with the same args == calling once
-#                      (true for launch/power, false for key presses: two
-#                      DPAD_DOWNs move twice)
-#   open_world_hint  - False: we only talk to one known device, not the internet
-# They are hints, not enforcement: the allow-lists are what bound the model.
-_READ = ToolAnnotations(read_only_hint=True, open_world_hint=False)
-_ACT = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=False)
-_ACT_IDEMPOTENT = ToolAnnotations(
-    read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=False
-)
-# The one exception to destructive_hint=False: a reboot interrupts whatever is
-# playing and can leave the Bluetooth remotes stuck, so clients should confirm.
-_DISRUPTIVE = ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_hint=False, open_world_hint=False)
+# assumed by the spec to be destructive, non-idempotent and open-world.
 
 
 # --- what an action returns ----------------------------------------------------------------
@@ -132,53 +121,89 @@ def _result(c: ShieldClient, detail: str, sent: list[str], outcome: Outcome = "d
     }
 
 
-@mcp.tool(title="Get Shield status", annotations=_READ)
-def get_status() -> Status:
-    """Start here. Whether the Shield is reachable, its power state, the foreground app, and volume.
+@mcp.tool(title="Get Shield status", annotations=READ_ONLY)
+def shield_get_status() -> Status:
+    """Start here. Query Shield TV power state, reachability, foreground app, and volume.
 
-    When it isn't reachable, stale is true: power, app and volume are the last known values (as_of says
-    when), and error says why. It does not say what is playing; get_now_playing does (if ADB is set up).
-    dry_run true means actions are reported, not sent.
+    <use_case>
+    Inspect Shield TV power, connectivity, active foreground package, and volume before issuing commands.
+    </use_case>
+
+    <important_notes>
+    - When unreachable, stale is true and values represent last known state.
+    - Video output routes to the Onkyo AVR input 'strm-box'.
+    </important_notes>
     """
     return client().snapshot()
 
 
-@mcp.tool(title="Get what's playing", annotations=_READ)
-async def get_now_playing() -> NowPlaying:
+@mcp.tool(title="Get what's playing", annotations=READ_ONLY)
+async def shield_get_now_playing() -> NowPlaying:
     """Report what is playing: app, title, subtitle (artist or channel), play state, position in seconds.
 
-    state is "idle" when nothing is playing. position_s is null for live TV. Needs ADB, enabled once with
-    `mcp-server-shieldtv adb-setup`; without it this returns an error saying so.
+    <use_case>
+    Retrieve playback metadata and playback state of media currently active on the Shield.
+    </use_case>
+
+    <important_notes>
+    - Requires ADB connection established via `mcp-server-shieldtv adb-setup`.
+    - position_s is null for live streaming TV.
+    </important_notes>
     """
     return await read_now_playing(client().settings)
 
 
-@mcp.tool(title="Check Bluetooth remotes", annotations=_READ)
-async def get_remotes() -> RemotesReport:
+@mcp.tool(title="Check Bluetooth remotes", annotations=READ_ONLY)
+async def shield_get_remotes() -> RemotesReport:
     """List the Shield's Bluetooth remotes (e.g. a Harmony hub) and whether each works.
 
-    state is "working", "stuck" (connected but its buttons do nothing; advice says how to fix it),
-    "connecting" or "disconnected" (normal for a remote not in use). Needs ADB (adb-setup).
+    <use_case>
+    Diagnose unresponsive physical or hub remotes paired to the Shield over Bluetooth.
+    </use_case>
+
+    <important_notes>
+    - Requires ADB connection (`mcp-server-shieldtv adb-setup`).
+    - Reports "stuck" state when a connected remote stops sending button events (common after sleep/reboot).
+    </important_notes>
     """
     return await read_remotes(client().settings)
 
 
-@mcp.tool(title="Reboot the Shield", annotations=_DISRUPTIVE)
-async def reboot_shield() -> RebootResult:
-    """Restart the Shield. Only do this when the user asks for a reboot: it stops whatever is playing.
+@mcp.tool(title="Reboot the Shield", annotations=DESTRUCTIVE)
+async def shield_reboot() -> RebootResult:
+    """Restart the Shield TV.
 
-    Takes about a minute: waits until the Shield is back, then checks the Bluetooth remotes, since a
-    reboot can leave them connected but not working. If so, advice says how to fix it. Needs ADB (adb-setup).
+    <use_case>
+    Reboot the device when software is unresponsive or remotes require a cold reset.
+    </use_case>
+
+    <important_notes>
+    - Disruptive: stops active playback and disconnects network services.
+    - Rate limited to 1 reboot per 120s to prevent rapid boot loops.
+    - Requires ADB connection (`mcp-server-shieldtv adb-setup`).
+    </important_notes>
     """
+    wait = _REBOOT_BUCKET.take(1.0)
+    if wait > 0:
+        raise ShieldError(refusal("reboot the Shield", wait, "Shield TV"))
     settings = client().settings
     if settings.dry_run:
         return reboot_dry_run(settings)
     return await reboot_and_check(settings)
 
 
-@mcp.tool(title="List launchable apps", annotations=_READ)
-def list_apps() -> dict[str, str]:
-    """List the app names launch_app accepts (friendly name -> the link it opens)."""
+@mcp.tool(title="List launchable apps", annotations=READ_ONLY)
+def shield_list_apps() -> dict[str, str]:
+    """List the app names launch_app accepts (friendly name -> the link it opens).
+
+    <use_case>
+    Discover valid app names for use with `shield_launch_app`.
+    </use_case>
+
+    <important_notes>
+    - Returns mapped friendly names from configuration.
+    </important_notes>
+    """
     return {name: app.target for name, app in client().settings.apps.items()}
 
 
@@ -188,9 +213,18 @@ def list_apps() -> dict[str, str]:
 Repeat = Annotated[int, Field(ge=1, le=10, description="How many times to press the key (1-10).")]
 
 
-@mcp.tool(title="Press a remote key", annotations=_ACT)
-def send_key(key: KeyName, repeat: Repeat = 1) -> ActionResult:
-    """Press a remote-control key on the Shield, e.g. DPAD_DOWN with repeat=3 to move down three rows."""
+@mcp.tool(title="Press a remote key", annotations=ACT)
+def shield_send_key(key: KeyName, repeat: Repeat = 1) -> ActionResult:
+    """Press a remote-control key on the Shield, e.g. DPAD_DOWN with repeat=3 to move down three rows.
+
+    <use_case>
+    Navigate Android TV interfaces, menus, and controls using directional pad, enter, back, and home.
+    </use_case>
+
+    <important_notes>
+    - Only sends allowed key enum values; power toggles and raw text typing are not supported.
+    </important_notes>
+    """
     c = client()
     sent = [f"KEYCODE_{key}"] * repeat
     if c.settings.dry_run:
@@ -200,19 +234,33 @@ def send_key(key: KeyName, repeat: Repeat = 1) -> ActionResult:
     return _result(c, f"Pressed {key} x{repeat}", sent)
 
 
-@mcp.tool(title="Launch an app", annotations=_ACT_IDEMPOTENT)
-async def launch_app(
-    app: Annotated[str, Field(description="Friendly app name from list_apps, e.g. 'netflix'.")],
+@mcp.tool(title="Launch an app", annotations=ACT_IDEMPOTENT)
+async def shield_launch_app(
+    app: Annotated[str, Field(description="Friendly app name from shield_list_apps, e.g. 'netflix'.")],
 ) -> ActionResult:
-    """Launch an app by friendly name (see list_apps), e.g. 'netflix' or 'youtube'.
+    """Launch an application on the Shield TV.
 
-    Succeeds only once the app is confirmed in the foreground; otherwise the error says what the Shield did.
+    <use_case>
+    Launch streaming media apps (e.g. Netflix, YouTube, Plex) by friendly name.
+    </use_case>
+
+    <important_notes>
+    - Video output requires Onkyo AVR input set to 'strm-box' and TV input set to AVR HDMI port.
+    - Confirms that the application is running in the foreground before returning.
+    - Unknown app names suggest closest matches from configured apps.
+    </important_notes>
     """
     c = client()
     resolved = c.settings.resolve_app(app)
     if resolved is None:
-        names = ", ".join(sorted(c.settings.apps))
-        raise ShieldError(f"Unknown app {app!r}. Known apps: {names}")
+        candidates = list(c.settings.apps.keys())
+        msg = unknown_with_suggestions(
+            "Known apps",
+            app,
+            candidates,
+            fallback=f"Known apps: {', '.join(sorted(candidates))}.",
+        )
+        raise ShieldError(msg)
     name = app.strip().lower()
     sent = [f"app_link {resolved.target}"]
     if c.settings.dry_run:
@@ -221,11 +269,18 @@ async def launch_app(
     return _result(c, f"Launched {name} ({package} is in the foreground)", sent)
 
 
-@mcp.tool(title="Wake or sleep the Shield", annotations=_ACT_IDEMPOTENT)
-async def set_power(state: Literal["on", "off"]) -> ActionResult:
-    """Wake the Shield ('on') or put it to sleep ('off'). Uses WAKEUP/SLEEP, not the POWER toggle.
+@mcp.tool(title="Wake or sleep the Shield", annotations=ACT_IDEMPOTENT)
+async def shield_set_power(state: Literal["on", "off"]) -> ActionResult:
+    """Wake the Shield ('on') or put it to sleep ('off').
 
-    Succeeds only once the Shield reports the new state. Already in that state: nothing is sent.
+    <use_case>
+    Manage device power state.
+    </use_case>
+
+    <important_notes>
+    - Uses discrete WAKEUP and SLEEP commands rather than ambiguous toggles.
+    - Idempotent: returns 'unchanged' if already in requested state.
+    </important_notes>
     """
     c = client()
     on = state == "on"
@@ -289,34 +344,34 @@ def keys_resource() -> str:
 # README example, so no server depends on another being connected.
 # ---------------------------------------------------------------------------
 @mcp.prompt(title="Watch something on the Shield")
-def watch(app: str, what: str = "") -> str:
+def shield_watch(app: str, what: str = "") -> str:
     """Wake the Shield, open an app, and get to what you want to watch."""
     goal = f" and find {what!r}" if what else ""
     return (
         f"Open {app} on the Shield{goal}. Please:\n"
-        "1. Call get_status. If reachable is false, tell me the error and stop.\n"
-        '2. If power is "standby", call set_power with state="on".\n'
-        f"3. Call launch_app with app={app!r}. If it says the app is unknown, call list_apps and ask me which "
+        "1. Call shield_get_status. If reachable is false, tell me the error and stop.\n"
+        '2. If power is "standby", call shield_set_power with state="on".\n'
+        f"3. Call shield_launch_app with app={app!r}. If it says the app is unknown, call shield_list_apps and ask me which "
         "one I meant.\n"
         + (
-            f"4. To find {what!r}, use send_key with DPAD_* keys and DPAD_CENTER, a few presses at a time, and "
+            f"4. To find {what!r}, use shield_send_key with DPAD_* keys and DPAD_CENTER, a few presses at a time, and "
             "ask me what's on screen when you can't tell (you can't see the TV). Don't type text: it isn't "
             "available.\n"
             if what
             else "4. Stop there and tell me it's open.\n"
         )
-        + "5. If ADB is set up, get_now_playing tells you what is playing; otherwise ask me."
+        + "5. If ADB is set up, shield_get_now_playing tells you what is playing; otherwise ask me."
     )
 
 
 @mcp.prompt(title="My remote stopped working")
-def remotes_not_working() -> str:
+def shield_remotes_not_working() -> str:
     """Check the Shield's Bluetooth remotes and say how to fix one that's connected but dead."""
     return (
         "My remote isn't controlling the Shield. Please:\n"
-        "1. Call get_status to check the Shield is reachable and on.\n"
-        "2. Call get_remotes (needs ADB; if it says ADB isn't set up, tell me to run "
+        "1. Call shield_get_status to check the Shield is reachable and on.\n"
+        "2. Call shield_get_remotes (needs ADB; if it says ADB isn't set up, tell me to run "
         "`mcp-server-shieldtv adb-setup` and stop).\n"
-        '3. For any remote whose state is "stuck", repeat the advice get_remotes gives. Do not reboot the '
+        '3. For any remote whose state is "stuck", repeat the advice shield_get_remotes gives. Do not reboot the '
         "Shield unless I ask: a reboot is what usually causes this."
     )

@@ -85,10 +85,10 @@ async def test_simulate_paired_then_call(tmp_path, monkeypatch, capsys):
                 break
             await asyncio.sleep(0.05)
         await asyncio.sleep(0.1)
-        assert await cli._cmd_call("launch_app", ["app=youtube"]) == 0
+        assert await cli._cmd_call("shield_launch_app", ["app=youtube"]) == 0
         result = json.loads(capsys.readouterr().out)
         assert result["outcome"] == "done" and result["shield"] == "SHIELD Android TV"
-        assert await cli._cmd_call("send_key", ["key=POWER"]) == 1  # not on the allow-list
+        assert await cli._cmd_call("shield_send_key", ["key=POWER"]) == 1  # not on the allow-list
         assert "Input should be" in capsys.readouterr().err
     finally:
         sim.cancel()
@@ -97,5 +97,5 @@ async def test_simulate_paired_then_call(tmp_path, monkeypatch, capsys):
 
 
 async def test_call_rejects_malformed_arguments(home, capsys):
-    assert await cli._cmd_call("send_key", ["HOME"]) == 2
+    assert await cli._cmd_call("shield_send_key", ["HOME"]) == 2
     assert "key=value" in capsys.readouterr().err
