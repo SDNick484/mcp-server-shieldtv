@@ -3,5 +3,5 @@
 # `python scripts/sync_shared.py --update`; see that script. An optional
 # `exclude = ["remote"]` names shared modules this repo doesn't take.
 repo = "SDNick484/mcp-server-shared"
-commit = "3472fe1c24fbbb112ac922a7860700cb6c751a58"
+commit = "73e65ec9e63c8c3a1b3831697da56c5b86854a5c"
 package = "shieldtv_mcp"

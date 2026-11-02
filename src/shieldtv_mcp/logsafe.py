@@ -36,6 +36,7 @@ from __future__ import annotations
 import ipaddress
 import logging
 import re
+import urllib.parse
 from collections.abc import Callable
 
 # A trailing "." ends a sentence ("connected to 10.0.0.5."), so only a dot
@@ -112,6 +113,66 @@ def register_identifier_pattern(
 def clear_identifier_patterns() -> None:
     """Forget every rule ``register_identifier_pattern`` added."""
     _IDENTIFIER_PATTERNS.clear()
+
+
+def mask_ip(address: str) -> str:
+    """Mask an IPv4 or IPv6 address while preserving loopback, unspecified, and hostnames."""
+    if not address or not isinstance(address, str):
+        return address
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return address
+    if ip.is_loopback or ip.is_unspecified:
+        return address
+    if isinstance(ip, ipaddress.IPv4Address):
+        return f"x.x.x.{address.split('.')[-1]}"
+    tail = address.rsplit(":", 1)[1] if ":" in address else ""
+    return f"x:x::{tail or '0'}"
+
+
+def mask_host_port(host_port: str) -> str:
+    """Mask host or host:port strings, preserving port numbers and non-IP hostnames."""
+    if not host_port or not isinstance(host_port, str):
+        return host_port
+    if host_port.startswith("[") and "]:" in host_port:
+        host, port = host_port[1:].split("]:", 1)
+        return f"[{mask_ip(host)}]:{port}"
+    if host_port.startswith("[") and host_port.endswith("]"):
+        return f"[{mask_ip(host_port[1:-1])}]"
+    if ":" in host_port and host_port.count(":") == 1:
+        host, port = host_port.split(":", 1)
+        return f"{mask_ip(host)}:{port}"
+    return mask_ip(host_port)
+
+
+def mask_url(url: str) -> str:
+    """Mask the host IP in a URL while preserving scheme, port, path, query, and userinfo."""
+    if not url or not isinstance(url, str):
+        return url
+    try:
+        parsed = urllib.parse.urlsplit(url)
+    except Exception:
+        return url
+    if not parsed.netloc:
+        return url
+    hostname = parsed.hostname
+    if not hostname:
+        return url
+    masked = mask_ip(hostname)
+    if masked == hostname:
+        return url
+    netloc = parsed.netloc
+    if f"[{hostname}]" in netloc:
+        netloc = netloc.replace(f"[{hostname}]", f"[{masked}]", 1)
+    else:
+        userinfo = ""
+        if "@" in netloc:
+            userinfo = netloc.split("@", 1)[0] + "@"
+        port_part = f":{parsed.port}" if parsed.port is not None else ""
+        host_repr = f"[{masked}]" if ":" in masked else masked
+        netloc = f"{userinfo}{host_repr}{port_part}"
+    return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
 
 
 def _ip(m: re.Match[str]) -> str:
