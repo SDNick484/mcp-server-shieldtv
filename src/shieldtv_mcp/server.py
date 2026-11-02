@@ -20,7 +20,6 @@ from contextlib import asynccontextmanager
 from typing import Annotated, Literal
 
 from mcp.server import MCPServer
-from mcp.types import ToolAnnotations
 from pydantic import Field
 from typing_extensions import TypedDict
 
@@ -37,7 +36,7 @@ from .client import ShieldClient, ShieldError, Status
 from .config import ALLOWED_KEYS, DEFAULT_APPS, KeyName, load_settings
 from .lookup import unknown_with_suggestions
 from .ratelimit import TokenBucket, refusal
-from .tools import ACT, ACT_IDEMPOTENT, DESTRUCTIVE, OPEN_WORLD_READ, READ_ONLY
+from .tools import ACT, ACT_IDEMPOTENT, DESTRUCTIVE, READ_ONLY
 
 log = logging.getLogger(__name__)
 
@@ -351,8 +350,8 @@ def shield_watch(app: str, what: str = "") -> str:
         f"Open {app} on the Shield{goal}. Please:\n"
         "1. Call shield_get_status. If reachable is false, tell me the error and stop.\n"
         '2. If power is "standby", call shield_set_power with state="on".\n'
-        f"3. Call shield_launch_app with app={app!r}. If it says the app is unknown, call shield_list_apps and ask me which "
-        "one I meant.\n"
+        f"3. Call shield_launch_app with app={app!r}. If it says the app is unknown, "
+        "call shield_list_apps and ask me which one I meant.\n"
         + (
             f"4. To find {what!r}, use shield_send_key with DPAD_* keys and DPAD_CENTER, a few presses at a time, and "
             "ask me what's on screen when you can't tell (you can't see the TV). Don't type text: it isn't "

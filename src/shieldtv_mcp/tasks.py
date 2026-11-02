@@ -107,7 +107,7 @@ def spawn_task(
 
     Two traps of a bare `create_task` whose result nobody awaits:
     - The loop holds tasks weakly, so a task with no other reference can be garbage collected before it
-      finishes. spawn_task holds one until the task is done.
+      finishes. spawn_task holds one in _BACKGROUND_TASKS while it runs, and discards it when it finishes.
     - An exception that ends the task goes nowhere until the task is collected, and then only as
       "Task exception was never retrieved" on stderr, with no hint of which worker died. spawn_task
       retrieves it as soon as the task ends and logs it (at ERROR, with the traceback and the task's

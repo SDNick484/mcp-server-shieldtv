@@ -272,7 +272,7 @@ async def test_unpaired_server_still_answers_status(config_dir, fake, monkeypatc
 
 async def test_reboot_rate_limit_refusal(mcp_client):
     # First reboot call takes the single token
-    res1 = await mcp_client.call_tool("shield_reboot", {})
+    await mcp_client.call_tool("shield_reboot", {})
     # May fail with ADB isn't set up, but token was consumed
     res2 = await mcp_client.call_tool("shield_reboot", {})
     assert res2.is_error

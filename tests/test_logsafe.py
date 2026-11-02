@@ -17,9 +17,6 @@ from shieldtv_mcp.logsafe import (
     RedactingFormatter,
     clear_custom_patterns,
     clear_identifier_patterns,
-    mask_host_port,
-    mask_ip,
-    mask_url,
     redact,
     redact_secrets,
     register_custom_pattern,
@@ -267,54 +264,3 @@ def test_tracebacks_are_redacted_too():
         record = logging.LogRecord("x", logging.ERROR, __file__, 1, "boom", (), sys.exc_info())
     out = RedactingFormatter("%(message)s").format(record)
     assert "192.168.1.147" not in out and JWT not in out and "x.x.x.147" in out
-
-
-def test_mask_ip():
-    # IPv4 LAN addresses
-    assert mask_ip("192.168.1.60") == "x.x.x.60"
-    assert mask_ip("192.0.2.20") == "x.x.x.20"
-    assert mask_ip("10.0.0.1") == "x.x.x.1"
-    assert mask_ip("172.16.0.5") == "x.x.x.5"
-
-    # IPv6 addresses
-    assert mask_ip("2001:db8::1") == "x:x::1"
-    assert mask_ip("2001:0db8:85a3:0000:0000:8a2e:0370:7334") == "x:x::7334"
-    assert mask_ip("fe80::1") == "x:x::1"
-    assert mask_ip("fe80::1%eth0") == "x:x::1%eth0"
-
-    # Loopback and unspecified preserved
-    assert mask_ip("127.0.0.1") == "127.0.0.1"
-    assert mask_ip("127.0.0.2") == "127.0.0.2"
-    assert mask_ip("0.0.0.0") == "0.0.0.0"
-    assert mask_ip("::1") == "::1"
-    assert mask_ip("::") == "::"
-
-    # Hostnames & non-IPs preserved
-    assert mask_ip("localhost") == "localhost"
-    assert mask_ip("myhub.local") == "myhub.local"
-    assert mask_ip("harmony-hub") == "harmony-hub"
-    assert mask_ip("") == ""
-    assert mask_ip("x.x.x.60") == "x.x.x.60"  # already masked
-
-
-def test_mask_host_port():
-    assert mask_host_port("192.168.1.100:1883") == "x.x.x.100:1883"
-    assert mask_host_port("192.0.2.20:5222") == "x.x.x.20:5222"
-    assert mask_host_port("127.0.0.1:8000") == "127.0.0.1:8000"
-    assert mask_host_port("localhost:1883") == "localhost:1883"
-    assert mask_host_port("[2001:db8::1]:1883") == "[x:x::1]:1883"
-    assert mask_host_port("[::1]:8000") == "[::1]:8000"
-    assert mask_host_port("192.168.1.100") == "x.x.x.100"
-    assert mask_host_port("") == ""
-
-
-def test_mask_url():
-    assert mask_url("http://192.168.1.50:8480/") == "http://x.x.x.50:8480/"
-    assert mask_url("http://192.168.1.50:8480/api/v1?device=tv#section") == "http://x.x.x.50:8480/api/v1?device=tv#section"
-    assert mask_url("http://user:pass@192.168.1.50:8480/") == "http://user:pass@x.x.x.50:8480/"
-    assert mask_url("http://[2001:db8::1]:8480/") == "http://[x:x::1]:8480/"
-    assert mask_url("http://localhost:8480/") == "http://localhost:8480/"
-    assert mask_url("http://127.0.0.1:8000/healthz") == "http://127.0.0.1:8000/healthz"
-    assert mask_url("mqtt://192.168.1.200:1883") == "mqtt://x.x.x.200:1883"
-    assert mask_url("") == ""
-    assert mask_url("not-a-url") == "not-a-url"
