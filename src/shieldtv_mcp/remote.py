@@ -52,6 +52,8 @@ import ipaddress
 import json
 import logging
 import os
+import re
+import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -67,7 +69,19 @@ log = logging.getLogger(__name__)
 ACCESS_HEADER = "cf-access-jwt-assertion"
 HEALTH_PATH = "/healthz"
 # Headers a proxy adds to what it forwards. A request with one didn't start on this machine.
-FORWARDED_HEADERS = ("forwarded", "x-forwarded-for", "x-real-ip", "cf-connecting-ip", "cf-ray")
+FORWARDED_HEADERS = (
+    "forwarded",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-real-ip",
+    "true-client-ip",
+    "cf-connecting-ip",
+    "cf-ray",
+    "via",
+)
+CORS_ALLOW_HEADERS = b"content-type, cf-access-jwt-assertion, authorization, mcp-session-id, mcp-protocol-version"
+_HOSTNAME_RE = re.compile(r"^[A-Za-z0-9.-]+$")
 
 
 class ConfigError(ValueError):
@@ -124,10 +138,17 @@ class HttpConfig:
 
     def check(self) -> None:
         """Refuse settings that would expose device control without auth."""
+        if not (1 <= self.port <= 65535):
+            raise ConfigError(f"--port must be between 1 and 65535 (got {self.port}).")
         if not self.path.startswith("/") or self.path == HEALTH_PATH:
             raise ConfigError(f"--path must start with '/' and can't be {HEALTH_PATH} (got {self.path!r}).")
-        if self.access is not None and not self.access.audiences:
-            raise ConfigError("CF_ACCESS_TEAM_DOMAIN is set but CF_ACCESS_AUD is empty; set the application's AUD tag.")
+        if self.access is not None:
+            if not _HOSTNAME_RE.fullmatch(self.access.team_domain):
+                raise ConfigError(f"CF_ACCESS_TEAM_DOMAIN must be a hostname (got {self.access.team_domain!r}).")
+            if not self.access.audiences:
+                raise ConfigError(
+                    "CF_ACCESS_TEAM_DOMAIN is set but CF_ACCESS_AUD is empty; set the application's AUD tag."
+                )
         if not self.loopback and self.access is None and not self.insecure_no_auth:
             raise ConfigError(
                 f"Refusing to serve on {self.bind} without Cloudflare Access: anyone who can reach this port could "
@@ -176,10 +197,14 @@ def http_config(args: argparse.Namespace, env: Mapping[str, str] | None = None) 
             audiences=_csv(env.get("CF_ACCESS_AUD")),
             emails=frozenset(e.lower() for e in _csv(env.get("MCP_ALLOWED_EMAILS"))),
         )
-    port = args.port or env.get("MCP_HTTP_PORT") or args._http_default_port
+    raw_port = args.port if args.port is not None else (env.get("MCP_HTTP_PORT") or args._http_default_port)
+    try:
+        port = int(raw_port)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"--port / MCP_HTTP_PORT must be an integer (got {raw_port!r}).") from exc
     return HttpConfig(
         bind=args.bind or env.get("MCP_HTTP_BIND") or "127.0.0.1",
-        port=int(port),
+        port=port,
         path=args.path or env.get("MCP_HTTP_PATH") or args._http_default_path,
         public_hosts=tuple(args.public_host) or _csv(env.get("MCP_PUBLIC_HOSTS")),
         access=access,
@@ -189,6 +214,7 @@ def http_config(args: argparse.Namespace, env: Mapping[str, str] | None = None) 
 
 # --- verifying Access assertions ---------------------------------------------------
 KeyResolver = Callable[[str], Awaitable[Any]]
+HealthChecker = Callable[[], Awaitable[Mapping[str, Any] | bool]]
 
 
 class AccessVerifier:
@@ -201,14 +227,35 @@ class AccessVerifier:
     """
 
     leeway = 30  # seconds of clock skew tolerated on exp/iat
+    min_refetch_interval = 60.0  # minimum seconds between JWKS network fetches on unknown kid
 
     def __init__(self, policy: AccessPolicy, key_resolver: KeyResolver | None = None) -> None:
         self.policy = policy
         if key_resolver is None:
-            client = jwt.PyJWKClient(policy.certs_url, cache_jwk_set=True, lifespan=3600)
+            client = jwt.PyJWKClient(policy.certs_url, cache_jwk_set=True, lifespan=3600, timeout=10)
+            lock = anyio.Lock()
+            last_fetch: float | None = None
 
-            async def resolve(token: str) -> Any:
-                key = await anyio.to_thread.run_sync(client.get_signing_key_from_jwt, token)
+            async def resolve(token: str) -> Any:  # pragma: no cover
+                nonlocal last_fetch
+                async with lock:
+                    header = jwt.get_unverified_header(token)
+                    kid = header.get("kid")
+                    now = time.monotonic()
+                    if client.jwk_set_cache is not None and not client.jwk_set_cache.is_expired():
+                        cached_set = client.jwk_set_cache.get()
+                        if cached_set is not None:
+                            cached_kids = {k.key_id for k in cached_set.keys}
+                            if (
+                                kid not in cached_kids
+                                and last_fetch is not None
+                                and (now - last_fetch) < self.min_refetch_interval
+                            ):
+                                raise jwt.PyJWKClientError(f"Unable to find a signing key that matches {kid!r}")
+                    try:
+                        key = await anyio.to_thread.run_sync(client.get_signing_key_from_jwt, token)
+                    finally:
+                        last_fetch = time.monotonic()
                 return key.key
 
             key_resolver = resolve
@@ -236,8 +283,8 @@ class AccessVerifier:
 
 
 # --- ASGI wrappers ---------------------------------------------------------------------
-async def _plain(send: Send, status: int, body: dict[str, str]) -> None:
-    data = json.dumps(body).encode()
+async def _plain(send: Send, status: int, body: Mapping[str, Any]) -> None:
+    data = json.dumps(dict(body)).encode()
     await send(
         {
             "type": "http.response.start",
@@ -257,17 +304,22 @@ class AccessMiddleware:
     instead (see the module docstring).
     """
 
-    def __init__(self, app: ASGIApp, verifier: AccessVerifier | None, *, local_only: bool = False) -> None:
+    def __init__(
+        self,
+        app: ASGIApp,
+        verifier: AccessVerifier | None,
+        *,
+        local_only: bool = False,
+        health_check: HealthChecker | None = None,
+    ) -> None:
         self.app = app
         self.verifier = verifier
         self.local_only = local_only
+        self.health_check = health_check
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
-            return
-        if scope["path"] == HEALTH_PATH:
-            await _plain(send, 200, {"status": "ok"})
             return
         headers = dict(scope.get("headers") or [])
         if self.verifier is None and self.local_only:
@@ -284,8 +336,46 @@ class AccessMiddleware:
                 )
                 await _plain(send, 403, {"error": "forbidden"})
                 return
+        if scope["path"] == HEALTH_PATH and scope.get("method") in ("GET", "HEAD"):
+            if self.health_check is None:
+                await _plain(send, 200, {"status": "ok"})
+                return
+            try:
+                res = await self.health_check()
+            except Exception as exc:
+                log.warning("Health check failed: %s", exc)
+                await _plain(send, 503, {"status": "degraded", "error": "health check failed"})
+                return
+            if res is False:
+                await _plain(send, 503, {"status": "degraded", "error": "health check returned False"})
+                return
+            if res is True:
+                await _plain(send, 200, {"status": "ok"})
+                return
+            if res.get("status") == "degraded" or "error" in res:
+                await _plain(send, 503, {**res, "status": "degraded"})
+            else:
+                await _plain(send, 200, {**res, "status": "ok"})
+            return
+        if scope.get("method") == "OPTIONS":
+            origin = headers.get(b"origin", b"*")
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 204,
+                    "headers": [
+                        (b"access-control-allow-origin", origin),
+                        (b"access-control-allow-methods", b"POST, GET, DELETE, OPTIONS"),
+                        (b"access-control-allow-headers", CORS_ALLOW_HEADERS),
+                        (b"access-control-max-age", b"86400"),
+                        (b"vary", b"Origin"),
+                    ],
+                }
+            )
+            await send({"type": "http.response.body", "body": b""})
+            return
         if self.verifier is not None:
-            token = headers.get(ACCESS_HEADER.encode(), b"").decode()
+            token = headers.get(ACCESS_HEADER.encode(), b"").decode("latin-1")
             try:
                 if not token:
                     raise AccessDenied("no Cloudflare Access assertion (request didn't come through Access)")
@@ -336,7 +426,13 @@ def _is_ip(text: str) -> bool:
         return False
 
 
-def build_app(mcp: MCPServer, cfg: HttpConfig, verifier: AccessVerifier | None = None) -> ASGIApp:
+def build_app(
+    mcp: MCPServer,
+    cfg: HttpConfig,
+    verifier: AccessVerifier | None = None,
+    *,
+    health_check: HealthChecker | None = None,
+) -> ASGIApp:
     """The ASGI app: the SDK's Streamable HTTP app, wrapped in the Access check."""
     cfg.check()
     if verifier is None and cfg.access is not None:
@@ -344,14 +440,16 @@ def build_app(mcp: MCPServer, cfg: HttpConfig, verifier: AccessVerifier | None =
     app = mcp.streamable_http_app(
         streamable_http_path=cfg.path, transport_security=transport_security(cfg), host=cfg.bind
     )
-    return AccessMiddleware(app, verifier, local_only=cfg.local_only)
+    return AccessMiddleware(app, verifier, local_only=cfg.local_only, health_check=health_check)
 
 
-def serve_http(mcp: MCPServer, cfg: HttpConfig) -> None:
+def serve_http(  # pragma: no cover
+    mcp: MCPServer, cfg: HttpConfig, *, health_check: HealthChecker | None = None
+) -> None:
     """Run until interrupted. The server's lifespan (device connections) runs once, shared by all sessions."""
     import uvicorn
 
-    app = build_app(mcp, cfg)
+    app = build_app(mcp, cfg, health_check=health_check)
     if cfg.access is None:
         log.warning("Serving %s on %s:%s WITHOUT Cloudflare Access checks.", cfg.path, cfg.bind, cfg.port)
     else:

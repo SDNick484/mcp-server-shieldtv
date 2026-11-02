@@ -1,0 +1,11 @@
+services:
+  shieldtv-mcp:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    image: sdnick484/mcp-server-shieldtv:latest
+    container_name: mcp-server-shieldtv
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      - SHIELDTV_HTTP_PORT=8712

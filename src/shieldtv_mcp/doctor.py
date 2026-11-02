@@ -33,10 +33,11 @@ from typing import Any
 
 from androidtvremote2 import AndroidTVRemote, CannotConnect, ConnectionClosed, InvalidAuth
 
-from .assumptions import unverified
+from .assumptions import ASSUMPTIONS, unverified
 from .client import check_credentials
 from .config import CLIENT_NAME, Settings, config_dir
 from .logsafe import redact
+from .registry import doctor_summary
 
 # HARDWARE_VALIDATION.md step that covers each layer, for the hints.
 STEP = {"config": 1, "tcp": 2, "identity": 2, "session": 2, "adb": 6, "mdns": 3}
@@ -271,5 +272,5 @@ def render(report: Report, redacted: bool = True) -> str:
 
 
 def to_json(report: Report, redacted: bool = True) -> str:
-    text = json.dumps({**asdict(report), "ok": report.ok}, indent=2)
+    text = json.dumps({**asdict(report), "ok": report.ok, "assumptions": doctor_summary(ASSUMPTIONS)}, indent=2)
     return redact(text) if redacted else text

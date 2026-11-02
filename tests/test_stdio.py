@@ -32,14 +32,14 @@ async def test_serve_over_stdio(tmp_path):
     async with Client(params) as c:
         names = {t.name for t in (await c.list_tools()).tools}
         assert names == {
-            "get_status",
-            "get_now_playing",
-            "get_remotes",
-            "list_apps",
-            "send_key",
-            "launch_app",
-            "set_power",
-            "reboot_shield",
+            "shield_get_status",
+            "shield_get_now_playing",
+            "shield_get_remotes",
+            "shield_list_apps",
+            "shield_send_key",
+            "shield_launch_app",
+            "shield_set_power",
+            "shield_reboot",
         }
-        status = (await c.call_tool("get_status", {})).structured_content
+        status = (await c.call_tool("shield_get_status", {})).structured_content
         assert (status["paired"], status["reachable"]) == (False, False)

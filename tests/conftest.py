@@ -23,6 +23,14 @@ def anyio_backend() -> str:
     return "asyncio"
 
 
+@pytest.fixture(autouse=True)
+def reset_reboot_bucket() -> None:
+    from shieldtv_mcp import server
+
+    server._REBOOT_BUCKET.tokens = server._REBOOT_BUCKET.capacity
+    server._REBOOT_BUCKET._last = server._REBOOT_BUCKET.clock()
+
+
 class FakeRemote:
     """Stands in for androidtvremote2.AndroidTVRemote.
 

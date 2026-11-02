@@ -47,10 +47,13 @@ Why it works the way it does:
 from __future__ import annotations
 
 import argparse
+import ast
 import contextlib
 import difflib
 import os
 import re
+import shutil
+import subprocess
 import sys
 import tomllib
 import urllib.error
@@ -64,6 +67,7 @@ PLACEHOLDER = "__PKG__"
 MANIFEST = "shared.toml"
 LOCK = "shared.lock"
 SELF = "scripts/sync_shared.py"  # where this script lives, in mcp-server-shared and in every sibling
+SHARED_MARKER = "Shared by the sibling servers"
 # The newest shared.toml format this script understands. 2 added `module` on [[file]] and, with
 # it, `exclude` in shared.lock. A format-1 script ignores both, and its --update would rewrite the
 # lock without `exclude`, quietly bringing excluded files back; the bump makes it fetch this
@@ -148,12 +152,34 @@ class Source(Protocol):
     def read(self, path: str) -> bytes: ...
 
 
+_GH_CLI_TOKEN: str | None | bool = False
+
+
+def _github_token() -> str | None:
+    env = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if env:
+        return env
+    global _GH_CLI_TOKEN
+    if _GH_CLI_TOKEN is False:
+        token: str | None = None
+        if shutil.which("gh"):
+            with contextlib.suppress(subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+                token = (
+                    subprocess.check_output(
+                        ["gh", "auth", "token"], text=True, stderr=subprocess.DEVNULL, timeout=5
+                    ).strip()
+                    or None
+                )
+        _GH_CLI_TOKEN = token
+    return _GH_CLI_TOKEN if isinstance(_GH_CLI_TOKEN, str) else None
+
+
 def _get(url: str, accept: str | None = None) -> bytes:
     """GET a URL; HTTPS_PROXY and SSL_CERT_FILE are honored the usual urllib way."""
     request = urllib.request.Request(url, headers={"User-Agent": "sync_shared.py"})
     if accept:
         request.add_header("Accept", accept)
-    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    token = _github_token()
     if token and urllib.parse.urlsplit(url).hostname in TOKEN_HOSTS:
         request.add_header("Authorization", f"Bearer {token}")
     try:
@@ -200,7 +226,11 @@ class LocalDir:
 
     def read(self, path: str) -> bytes:
         try:
-            return (self.root / path).read_bytes()
+            root_resolved = self.root.resolve()
+            target = (root_resolved / path).resolve()
+            if not target.is_relative_to(root_resolved):
+                raise SyncError(f"{path} resolves outside {self.root}")
+            return target.read_bytes()
         except OSError as exc:
             raise SyncError(f"{self.root / path}: {exc.strerror}") from None
 
@@ -264,8 +294,17 @@ def wanted_files(
                 f"{MANIFEST} in {source.label} is format {fmt}, newer than this script ({FORMAT}). "
                 "Run the same command without --check: it brings in the newer script, then run this again."
             )
-        (root / SELF).parent.mkdir(parents=True, exist_ok=True)
-        (root / SELF).write_bytes(source.read(SELF))
+        new_script = source.read(SELF)
+        try:
+            ast.parse(new_script.decode("utf-8"), filename=SELF)
+        except (UnicodeDecodeError, SyntaxError) as exc:
+            raise SyncError(f"refusing to update {SELF}: invalid Python syntax ({exc})") from None
+        root_resolved = root.resolve()
+        self_path = (root_resolved / SELF).resolve()
+        if not self_path.is_relative_to(root_resolved):
+            raise SyncError(f"refusing to write {SELF}: resolves outside {root}")
+        self_path.parent.mkdir(parents=True, exist_ok=True)
+        self_path.write_bytes(new_script)
         raise SyncError(f"Updated {SELF} for {MANIFEST} format {fmt}. Run the same command again.")
     # A typo ("remot") would otherwise exclude nothing, silently. So would a module that was renamed
     # or dropped in mcp-server-shared: then this lock's exclude is out of date and should say so.
@@ -303,15 +342,47 @@ def differences(root: Path, files: dict[str, bytes]) -> list[tuple[str, str]]:
     return found
 
 
-def write_files(root: Path, files: dict[str, bytes]) -> list[str]:
+def write_files(root: Path, files: dict[str, bytes], *, dry_run: bool = False) -> list[str]:
     """Write the copies that differ; return their paths. Unchanged files are left alone (and their mtimes)."""
     changed = []
+    root_resolved = root.resolve()
     for target, status in differences(root, files):
-        path = root / target
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(files[target])  # bytes, so no newline translation: copies stay byte-identical
+        if not dry_run:
+            path = (root_resolved / target).resolve()
+            if not path.is_relative_to(root_resolved):
+                raise SyncError(f"refusing to write {target}: resolves outside {root}")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(files[target])  # bytes, so no newline translation: copies stay byte-identical
         changed.append(f"{target} ({'added' if status == 'missing' else 'updated'})")
     return changed
+
+
+def find_orphans(root: Path, package: str, wanted: dict[str, bytes], exclude: tuple[str, ...] = ()) -> list[str]:
+    """Previously synced shared files in src/<package>/ or tests/ that are no longer in shared.toml."""
+    excluded_paths = {f"src/{package}/{mod}.py" for mod in exclude} | {f"tests/test_{mod}.py" for mod in exclude}
+    candidates: list[Path] = []
+    if package and (root / "src" / package).is_dir():
+        candidates.extend(sorted((root / "src" / package).glob("*.py")))
+    if (root / "tests").is_dir():
+        candidates.extend(sorted((root / "tests").glob("test_*.py")))
+    orphans: list[str] = []
+    for path in candidates:
+        rel = path.relative_to(root).as_posix()
+        if rel in wanted or rel in excluded_paths:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        if SHARED_MARKER in text:
+            orphans.append(rel)
+    return orphans
+
+
+def _report_orphans(root: Path, package: str, wanted: dict[str, bytes], exclude: tuple[str, ...]) -> None:
+    with contextlib.suppress(BrokenPipeError):
+        for orphan in find_orphans(root, package, wanted, exclude):
+            print(f"(shared files: {orphan} is no longer in {MANIFEST}; remove manually if unused)")
 
 
 def _diff(local: Path, wanted: bytes, label: str) -> list[str]:
@@ -347,13 +418,17 @@ def report(root: Path, files: dict[str, bytes], label: str, fix: str) -> int:
     return 1
 
 
+def _gha_escape(text: str) -> str:
+    return text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
 def _print_report(root: Path, files: dict[str, bytes], found: list[tuple[str, str]], label: str, fix: str) -> None:
     annotate = os.environ.get("GITHUB_ACTIONS") == "true"
     print(f"shared files: {len(found)} of {len(files)} don't match {label}:")
     for target, status in found:
         print(f"  {target}: {status}  -> fix: {fix}")
         if annotate:  # shows on the file in the PR's "Files changed" view
-            print(f"::error file={target}::{target} {status} from {label}. Fix: {fix}")
+            print(f"::error file={_gha_escape(target)}::{_gha_escape(f'{target} {status} from {label}. Fix: {fix}')}")
     print(
         f"\nFix them all with `{fix}`. If you meant to change a shared file, make the change in "
         "mcp-server-shared instead, push it to main, then run `python scripts/sync_shared.py --update` here."
@@ -372,6 +447,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     )
     parser.add_argument("--update", action="store_true", help="move shared.lock to mcp-server-shared main first")
     parser.add_argument("--check", action="store_true", help="don't write; exit 1 if any copy differs")
+    parser.add_argument("--dry-run", action="store_true", help="show what would change without writing files or lock")
     parser.add_argument("--latest", action="store_true", help="with --check: compare against main, not the lock")
     parser.add_argument("--source", type=Path, help="read files from this local mcp-server-shared checkout")
     parser.add_argument("--package", help="package name for __PKG__ (default: from shared.lock)")
@@ -382,6 +458,8 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="the repo to sync (default: the one this script is in)",
     )
     args = parser.parse_args(argv)
+    if args.dry_run and args.check:
+        parser.error("--dry-run cannot be combined with --check (--check already never writes)")
     if args.latest and not args.check:
         parser.error("--latest only goes with --check (to move to main and write, use --update)")
     if args.update and args.check:
@@ -399,6 +477,7 @@ def _excluding(exclude: tuple[str, ...]) -> str:
 
 def run(args: argparse.Namespace) -> int:
     root: Path = args.root
+    dry_run: bool = bool(getattr(args, "dry_run", False))
 
     if args.source:
         # mcp-server-shared itself renders its tests with --package and has no lock; a sibling
@@ -407,13 +486,17 @@ def run(args: argparse.Namespace) -> int:
         package = args.package or (lock_or_none.package if lock_or_none else "")
         exclude = lock_or_none.exclude if lock_or_none else ()
         local = LocalDir(args.source.resolve())
-        files = wanted_files(local, package, writing=not args.check, root=root, exclude=exclude)
+        files = wanted_files(local, package, writing=not (args.check or dry_run), root=root, exclude=exclude)
         label = local.label + _excluding(exclude)
         if args.check:
-            return report(root, files, label, f"python scripts/sync_shared.py --source {args.source}")
-        changed = write_files(root, files)
-        print(f"synced from {label}: " + (", ".join(changed) if changed else "nothing to change"))
-        return 0
+            status = report(root, files, label, f"python scripts/sync_shared.py --source {args.source}")
+            _report_orphans(root, package, files, exclude)
+            return status
+        changed = write_files(root, files, dry_run=dry_run)
+        prefix = f"dry run, would sync from {label}" if dry_run else f"synced from {label}"
+        print(f"{prefix}: " + (", ".join(changed) if changed else "nothing to change"))
+        _report_orphans(root, package, files, exclude)
+        return 1 if (dry_run and changed) else 0
 
     lock = read_lock(root)
     package = args.package or lock.package
@@ -429,29 +512,36 @@ def run(args: argparse.Namespace) -> int:
                 # Nothing shared changed between the lock and main (a README edit, say), so this
                 # repo isn't behind in any way that matters; --update would only move the lock.
                 print(f"(shared.lock is at {lock.commit[:7]}, main at {main[:7]}, with no shared file changed)")
+            _report_orphans(root, package, files, exclude)
             return status
         source = GitHub(lock.repo, lock.commit, "locked")
         files = wanted_files(source, package, writing=False, root=root, exclude=exclude)
-        return report(root, files, source.label + _excluding(exclude), "python scripts/sync_shared.py")
+        status = report(root, files, source.label + _excluding(exclude), "python scripts/sync_shared.py")
+        _report_orphans(root, package, files, exclude)
+        return status
 
     if args.update:
         main = resolve_main(lock.repo)
         source = GitHub(lock.repo, main, "main")
-        files = wanted_files(source, package, writing=True, root=root, exclude=exclude)
-        changed = write_files(root, files)
+        files = wanted_files(source, package, writing=not dry_run, root=root, exclude=exclude)
+        changed = write_files(root, files, dry_run=dry_run)
         new_lock = Lock(lock.repo, main, lock.package, lock.exclude)  # exclude carries over unchanged
-        if new_lock != lock:
+        if new_lock != lock and not dry_run:
             (root / LOCK).write_text(new_lock.dump(), encoding="utf-8")  # last: only once every file is in
         moved = f"{lock.commit[:7]} -> {main[:7]}" if main != lock.commit else f"already at {main[:7]}"
-        print(f"shared.lock: {moved}{_excluding(exclude)}; " + (", ".join(changed) if changed else "no files changed"))
-        return 0
+        prefix = "dry run, shared.lock" if dry_run else "shared.lock"
+        print(f"{prefix}: {moved}{_excluding(exclude)}; " + (", ".join(changed) if changed else "no files changed"))
+        _report_orphans(root, package, files, exclude)
+        return 1 if (dry_run and (changed or new_lock != lock)) else 0
 
     source = GitHub(lock.repo, lock.commit, "locked")
-    files = wanted_files(source, package, writing=True, root=root, exclude=exclude)
-    changed = write_files(root, files)
+    files = wanted_files(source, package, writing=not dry_run, root=root, exclude=exclude)
+    changed = write_files(root, files, dry_run=dry_run)
     label = source.label + _excluding(exclude)
-    print(f"synced from {label}: " + (", ".join(changed) if changed else "nothing to change"))
-    return 0
+    prefix = f"dry run, would sync from {label}" if dry_run else f"synced from {label}"
+    print(f"{prefix}: " + (", ".join(changed) if changed else "nothing to change"))
+    _report_orphans(root, package, files, exclude)
+    return 1 if (dry_run and changed) else 0
 
 
 def main(argv: list[str] | None = None) -> int:
