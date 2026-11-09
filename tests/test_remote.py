@@ -10,6 +10,7 @@ throwaway RSA key, so nothing here needs Cloudflare.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import socket
 import time
 from contextlib import asynccontextmanager
@@ -96,7 +97,7 @@ def test_unsafe_or_incomplete_settings_are_refused(argv, env, message):
 
 def test_insecure_flag_is_an_explicit_opt_out():
     parse(["--bind", "0.0.0.0", "--insecure-no-auth"]).check()
-    parse(["--bind", "0.0.0.0", "--public-host", "192.168.1.10", "--insecure-no-auth"]).check()
+    parse(["--bind", "0.0.0.0", "--public-host", "192.0.2.10", "--insecure-no-auth"]).check()
 
 
 def test_a_public_host_is_fine_with_access():
@@ -162,8 +163,21 @@ async def test_unsigned_tokens_are_denied():
 async def test_email_allow_list():
     policy = remote.AccessPolicy(TEAM, (AUD,), frozenset({"user@example.com"}))
     await remote.AccessVerifier(policy, public_key).verify(token(email="USER@example.com"))
-    with pytest.raises(remote.AccessDenied, match="not in MCP_ALLOWED_EMAILS"):
+    with pytest.raises(remote.AccessDenied, match="not in MCP_ALLOWED_EMAILS") as denied:
         await remote.AccessVerifier(policy, public_key).verify(token(email="guest@example.com"))
+    # The rejected identity is named only enough to tell logins apart: the log line this becomes
+    # may be pasted into an issue.
+    assert "g***@example.com" in str(denied.value) and "guest@example.com" not in str(denied.value)
+    with pytest.raises(remote.AccessDenied, match="this identity is not in MCP_ALLOWED_EMAILS"):
+        await remote.AccessVerifier(policy, public_key).verify(token(email=""))
+
+
+def test_policy_repr_hides_the_allow_list():
+    """A config repr ends up in logs and tracebacks; the e-mail allow-list must not."""
+    policy = remote.AccessPolicy(TEAM, (AUD,), frozenset({"user@example.com"}))
+    assert "user@example.com" not in repr(policy)
+    assert "user@example.com" not in repr(remote.HttpConfig(access=policy))
+    assert policy.emails == frozenset({"user@example.com"})  # still there for the check itself
 
 
 # --- end to end over real HTTP ------------------------------------------------------
@@ -203,6 +217,63 @@ async def running(
             await anyio.sleep(0.01)
         yield f"http://127.0.0.1:{port}"
         server.should_exit = True
+
+
+@pytest.mark.anyio
+async def test_shutdown_with_a_stuck_tool_call_still_runs_the_lifespan_shutdown():
+    """What supervise-daemon's SIGTERM/5 must not hit: a tool call blocked on an unresponsive device
+    keeps a response open, and uvicorn by default waits for it forever, so the lifespan shutdown
+    (device disconnects) never runs before the SIGKILL. With serve_http's settings the response is
+    closed within SHUTDOWN_TIMEOUT and the lifespan shutdown runs, inside the supervisor's budget."""
+    import uvicorn
+
+    events: list[str] = []
+
+    @asynccontextmanager
+    async def lifespan(_s: MCPServer):
+        events.append("start")
+        yield
+        events.append("stop")
+
+    mcp = MCPServer("thing", lifespan=lifespan)
+
+    @mcp.tool()
+    async def stuck() -> str:
+        """Never answers, like a TV that stopped replying mid-command."""
+        await anyio.sleep(60)
+        return "never"
+
+    cfg = remote.HttpConfig(path="/thing/mcp")
+    settings = remote.uvicorn_settings(cfg)
+    assert settings["timeout_graceful_shutdown"] == remote.SHUTDOWN_TIMEOUT and settings["proxy_headers"] is False
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    # Everything serve_http passes except the address (the pre-bound socket stands in) and the log level
+    config = uvicorn.Config(
+        remote.build_app(mcp, cfg), **{k: v for k, v in settings.items() if k not in ("host", "port", "log_level")}
+    )
+    server = uvicorn.Server(config)
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(server.serve, [sock])
+        while not server.started:
+            await anyio.sleep(0.01)
+
+        async def call_stuck_tool() -> None:
+            with anyio.move_on_after(remote.SHUTDOWN_TIMEOUT + 3):  # the call is expected to be cut off
+                async with mcp_client(f"http://127.0.0.1:{port}/thing/mcp", {}) as c:
+                    with contextlib.suppress(Exception):  # the server closes the connection under it
+                        await c.call_tool("stuck", {})
+
+        tg.start_soon(call_stuck_tool)
+        await anyio.sleep(0.3)  # the call is in flight
+        started = time.monotonic()
+        server.should_exit = True  # what the SIGTERM handler sets
+        with anyio.fail_after(remote.SHUTDOWN_TIMEOUT + 3):
+            while "stop" not in events:
+                await anyio.sleep(0.02)
+        assert time.monotonic() - started < remote.SHUTDOWN_TIMEOUT + 2  # inside supervise-daemon's 5 s
+    assert events == ["start", "stop"]
 
 
 def mcp_client(url: str, headers: dict[str, str]) -> Client:
@@ -318,8 +389,8 @@ async def test_wildcard_bind_keeps_host_checks_on(caplog):
     assert sec.enable_dns_rebinding_protection is True
     assert "127.0.0.1:*" in sec.allowed_hosts and not any("evil" in h for h in sec.allowed_hosts)
     assert "Binding to 0.0.0.0 with no --public-host" in caplog.text
-    lan = remote.transport_security(remote.HttpConfig(bind="0.0.0.0", public_hosts=("192.168.1.10",)))
-    assert "192.168.1.10:*" in lan.allowed_hosts and "http://192.168.1.10:*" in lan.allowed_origins
+    lan = remote.transport_security(remote.HttpConfig(bind="0.0.0.0", public_hosts=("192.0.2.10",)))
+    assert "192.0.2.10:*" in lan.allowed_hosts and "http://192.0.2.10:*" in lan.allowed_origins
 
 
 def test_ipv6_bind_and_public_hosts_in_transport_security(caplog):
@@ -368,7 +439,7 @@ async def test_without_access_forwarded_requests_get_403(header):
 @pytest.mark.anyio
 async def test_insecure_no_auth_serves_forwarded_requests_too():
     cfg = remote.HttpConfig(path="/thing/mcp", insecure_no_auth=True)
-    async with running(cfg, []) as base, mcp_client(f"{base}/thing/mcp", {"x-forwarded-for": "192.168.1.20"}) as c:
+    async with running(cfg, []) as base, mcp_client(f"{base}/thing/mcp", {"x-forwarded-for": "192.0.2.20"}) as c:
         assert (await c.call_tool("ping", {})).content[0].text == "pong"
 
 

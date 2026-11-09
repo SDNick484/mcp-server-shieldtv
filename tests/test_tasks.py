@@ -16,6 +16,7 @@ import logging
 
 import pytest
 
+from shieldtv_mcp import tasks as tasks_module
 from shieldtv_mcp.tasks import (
     _BACKGROUND_TASKS,
     _consume_abandoned_exception,
@@ -82,14 +83,17 @@ async def start():
         await asyncio.wait([task for _, task in started], timeout=1)
 
 
-async def stop_in_its_own_task(task: asyncio.Task[None], timeout: float = 5.0) -> asyncio.Task[None]:
+async def stop_in_its_own_task(task: asyncio.Task[None], timeout: float = 5.0, grace: float = 0.25) -> asyncio.Task[None]:
     """Run stop_task in a separate task, waiting at most 3 s for it.
 
     Not `asyncio.wait_for(stop_task(...))`: a timeout works by cancelling the
     awaiting task, and a stop that swallowed its caller's cancellation would
     pass that check while still hung. Watching it from outside can't be fooled.
+
+    `grace` defaults to 0.25 s here, not stop_task's 1 s, so the dropped-cancel
+    rounds these tests exercise come quickly; the default is tested on its own.
     """
-    stopping = asyncio.create_task(stop_task(task, timeout, "the test task"))
+    stopping = asyncio.create_task(stop_task(task, timeout, "the test task", grace=grace))
     done, _ = await asyncio.wait({stopping}, timeout=3)
     assert stopping in done, "stop_task hung"
     return stopping
@@ -112,6 +116,77 @@ async def test_a_dropped_cancellation_is_retried(start):
     worker, task = await start(drops=1)
     await stop_in_its_own_task(task)
     assert worker.dropped == 1 and task.done()
+
+
+async def test_a_cleanup_that_takes_a_while_is_not_cut_off(start):
+    """The reason for `grace`: a second cancel lands wherever the task is awaiting, including in the
+    `finally:` where it closes its connection. With the default grace, a 0.6 s close completes."""
+    state: dict[str, bool] = {}
+
+    async def worker() -> None:
+        try:
+            await asyncio.sleep(3600)
+        finally:
+            try:
+                await asyncio.sleep(0.6)  # an MQTT DISCONNECT + socket close, say
+                state["closed_cleanly"] = True
+            except asyncio.CancelledError:
+                state["cleanup_interrupted"] = True
+                raise
+
+    task = asyncio.create_task(worker())
+    await asyncio.sleep(0.05)
+    loop = asyncio.get_running_loop()
+    t = loop.time()
+    await stop_task(task, 5.0, "the test task")  # default grace
+    assert state == {"closed_cleanly": True} and task.cancelled()
+    assert 0.5 < loop.time() - t < 1.0  # ended when the cleanup did, not at the next cancel
+
+
+async def test_a_short_grace_does_cut_the_cleanup_off(start):
+    """The flip side, so the default's value is visible: with grace shorter than the cleanup, the
+    cleanup is interrupted (this is what every stop_task call did before `grace` existed)."""
+    state: dict[str, bool] = {}
+
+    async def worker() -> None:
+        try:
+            await asyncio.sleep(3600)
+        finally:
+            try:
+                await asyncio.sleep(0.6)
+                state["closed_cleanly"] = True
+            except asyncio.CancelledError:
+                state["cleanup_interrupted"] = True
+                raise
+
+    task = asyncio.create_task(worker())
+    await asyncio.sleep(0.05)
+    await stop_task(task, 5.0, "the test task", grace=0.1)
+    assert state == {"cleanup_interrupted": True}
+
+
+async def test_a_dropped_cancel_is_still_retried_with_the_default_grace(start):
+    worker, task = await start(drops=1)
+    loop = asyncio.get_running_loop()
+    t = loop.time()
+    await stop_in_its_own_task(task, grace=tasks_module.DEFAULT_GRACE)
+    assert worker.dropped == 1 and task.done()
+    assert 0.9 < loop.time() - t < 1.6  # the second cancel went out after about a second, not at once
+
+
+async def test_grace_longer_than_the_timeout_still_returns_on_time(start, caplog):
+    caplog.set_level(logging.WARNING)
+    _, task = await start(drops=None)
+    loop = asyncio.get_running_loop()
+    t = loop.time()
+    await stop_in_its_own_task(task, timeout=0.5, grace=10.0)
+    assert loop.time() - t < 1.0 and not task.done()
+    assert "didn't stop within" in caplog.text
+
+
+async def test_negative_grace_is_refused():
+    with pytest.raises(ValueError, match="grace"):
+        await stop_tasks([asyncio.create_task(asyncio.sleep(0))], 1.0, grace=-1)
 
 
 async def test_the_callers_cancellation_still_propagates(start):
@@ -150,11 +225,11 @@ async def test_a_task_that_already_failed_is_logged_not_raised(caplog):
 # --- stop_tasks: several at once, within one timeout -----------------------------------------------
 
 
-async def stop_all_in_its_own_task(tasks: list[asyncio.Task[None] | None], timeout: float) -> float:
+async def stop_all_in_its_own_task(tasks: list[asyncio.Task[None] | None], timeout: float, grace: float = 0.25) -> float:
     """Run stop_tasks in a separate task (see stop_in_its_own_task) and return how long it took."""
     loop = asyncio.get_running_loop()
     t = loop.time()
-    stopping = asyncio.create_task(stop_tasks(tasks, timeout, "the test tasks"))
+    stopping = asyncio.create_task(stop_tasks(tasks, timeout, "the test tasks", grace=grace))
     done, _ = await asyncio.wait({stopping}, timeout=3)
     assert stopping in done, "stop_tasks hung"
     stopping.result()

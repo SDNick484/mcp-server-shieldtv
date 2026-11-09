@@ -28,14 +28,14 @@ def test_suggest_finds_substring_and_fuzzy_matches_without_duplicates():
 
 def test_unknown_with_suggestions_includes_matches_or_fallback():
     msg = unknown_with_suggestions(
-        "activity Watch TV on Den", "VolUp", COMMANDS, fallback="Use list_commands to see what it accepts."
+        "activity Watch TV on hub-1", "VolUp", COMMANDS, fallback="Use list_commands to see what it accepts."
     )
-    assert msg == "activity Watch TV on Den has no 'VolUp'. Closest matches: 'VolumeUp', 'VolumeDown'."
+    assert msg == "activity Watch TV on hub-1 has no 'VolUp'. Closest matches: 'VolumeUp', 'VolumeDown'."
 
     miss = unknown_with_suggestions(
-        "activity Watch TV on Den", "EjectDisc", COMMANDS, fallback="Use list_commands to see what it accepts."
+        "activity Watch TV on hub-1", "EjectDisc", COMMANDS, fallback="Use list_commands to see what it accepts."
     )
-    assert miss == "activity Watch TV on Den has no 'EjectDisc'. Use list_commands to see what it accepts."
+    assert miss == "activity Watch TV on hub-1 has no 'EjectDisc'. Use list_commands to see what it accepts."
 
     bare = unknown_with_suggestions("device Shield", "EjectDisc", ())
     assert bare == "device Shield has no 'EjectDisc'."

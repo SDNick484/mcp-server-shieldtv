@@ -17,6 +17,7 @@ from shieldtv_mcp.logsafe import (
     RedactingFormatter,
     clear_custom_patterns,
     clear_identifier_patterns,
+    mask_email,
     mask_host_port,
     mask_ip,
     mask_url,
@@ -39,7 +40,7 @@ def custom_patterns(monkeypatch):
 
 
 def test_addresses_and_macs():
-    assert redact("eISCP -> 192.168.1.147 PWR01") == "eISCP -> x.x.x.147 PWR01"
+    assert redact("eISCP -> 192.0.2.147 PWR01") == "eISCP -> x.x.x.147 PWR01"
     assert redact("mac 00:09:B0:F7:6C:FD / 0009B0F76CFD") == "mac xx:xx:xx:xx:6C:FD / xxxxxxxx6CFD"
     assert redact("simulator at 127.0.0.1:60128") == "simulator at 127.0.0.1:60128"  # loopback kept
     assert redact("bound to 0.0.0.0:8000") == "bound to 0.0.0.0:8000"  # unspecified kept
@@ -65,7 +66,7 @@ def test_lowercase_bare_macs():
         ("prefix 2001:db8::", "prefix x:x::0"),
         ("connected to 2001:db8::1.", "connected to x:x::1."),  # end of a sentence
         ("ipv6:fe80::1 up", "ipv6:x:x::1 up"),  # after a label's colon
-        ("mapped ::ffff:192.168.1.5", "mapped ::ffff:x.x.x.5"),  # the IPv4 rule takes the tail
+        ("mapped ::ffff:192.0.2.5", "mapped ::ffff:x.x.x.5"),  # the IPv4 rule takes the tail
     ],
 )
 def test_ipv6_addresses(line, expected):
@@ -101,7 +102,7 @@ def test_ipv6_and_macs_dont_clobber_each_other():
 
 
 def test_ipv4_at_the_end_of_a_sentence():
-    assert redact("connected to 192.168.1.5.") == "connected to x.x.x.5."
+    assert redact("connected to 192.0.2.5.") == "connected to x.x.x.5."
     assert redact("version 1.2.3.4.5") == "version 1.2.3.4.5"  # five groups: not an address
 
 
@@ -146,12 +147,95 @@ def test_json_secret_redaction():
     assert redact_secrets(py_dict) == "{'password': '***', 'apikey': '***'}"
 
 
+@pytest.mark.parametrize(
+    "line, expected",
+    [
+        # OAuth callbacks and token endpoints: the names _QUERY_SECRET used to miss
+        ("GET /cb?access_token=S3CRET&state=x", "GET /cb?access_token=***&state=x"),
+        ("GET /cb?code=S3CRET&id_token=S3CRET&refresh_token=S3CRET", "GET /cb?code=***&id_token=***&refresh_token=***"),
+        ("https://h/x?client_secret=S3CRET&sig=S3CRET&auth=S3CRET", "https://h/x?client_secret=***&sig=***&auth=***"),
+        # Every Authorization scheme, not just Bearer
+        ("Authorization: Basic dXNlcjpwYXNzd29yZA==", "Authorization: Basic [redacted]"),
+        ("authorization: Token S3CRET-abc", "authorization: Token [redacted]"),
+        ("Proxy-Authorization: Digest S3CRET", "Proxy-Authorization: Digest [redacted]"),
+        ("{'authorization': 'Basic S3CRET'}", "{'authorization': 'Basic [redacted]'}"),
+        ("a basic check", "a basic check"),  # the word in prose is not a credential
+        # Cloudflare Access service tokens and session cookie
+        ("CF-Access-Client-Id: 0123abcd.access", "CF-Access-Client-Id: ***"),
+        ("CF-Access-Client-Secret: 0123456789abcdef0123456789abcdef", "CF-Access-Client-Secret: ***"),
+        ("Cookie: CF_Authorization=S3CRET; theme=dark", "Cookie: CF_Authorization=[redacted]; theme=dark"),
+        ("Set-Cookie: CF_Authorization=S3CRET; Path=/", "Set-Cookie: CF_Authorization=[redacted]; Path=/"),
+        # Dict/headers reprs, as httpx and aiohttp exceptions print them
+        (
+            "headers={'cf-access-client-secret': 'S3CRET', 'x-api-key': 'S3CRET', 'token': 'S3CRET', 'host': 'h'}",
+            "headers={'cf-access-client-secret': '***', 'x-api-key': '***', 'token': '***', 'host': 'h'}",
+        ),
+        # Device pairing secrets in JSON blobs (webOS client-key, pairing pins, Wi-Fi PSKs)
+        ('{"pairing_key": "S3CRET", "pin": "1234", "psk": "S3CRET", "code": 200}', '{"pairing_key": "***", "pin": "***", "psk": "***", "code": 200}'),
+        # .env / shell style; names that aren't secrets stay
+        ("MQTT_PASSWORD=S3CRET CF_ACCESS_AUD=abc123 MQTT_HOST=broker", "MQTT_PASSWORD=*** CF_ACCESS_AUD=abc123 MQTT_HOST=broker"),
+        ("HA_TOKEN=S3CRET", "HA_TOKEN=***"),
+        ("MQTT_PASSWORD= (unset)", "MQTT_PASSWORD= (unset)"),
+        # Header-style lines at the start of a line; a sentence mentioning the word is left alone
+        ("x-api-key: S3CRET, next", "x-api-key: ***, next"),
+        ("the token: expired at noon", "the token: expired at noon"),
+    ],
+)
+def test_more_secret_shapes(line, expected):
+    assert redact_secrets(line) == expected
+    assert redact(line) == expected  # the address rules don't disturb these
+
+
+def test_mask_email():
+    assert mask_email("user@example.com") == "u***@example.com"
+    assert mask_email("a@b") == "a***@b"
+    assert mask_email("not-an-email") == "not-an-email"
+    assert mask_email("") == ""
+
+
+# --- property-based: the rules must be idempotent and leave no address behind ------------------
+# hypothesis is optional for the siblings (it isn't in their dev dependencies): without it only
+# these tests are skipped, never the module (a module-level importorskip would skip everything).
+try:
+    import hypothesis
+    import hypothesis.strategies as st
+except ImportError:  # pragma: no cover
+    hypothesis = None  # type: ignore[assignment]
+
+needs_hypothesis = pytest.mark.skipif(hypothesis is None, reason="property tests need hypothesis")
+if hypothesis is not None:
+    _settings = hypothesis.settings(max_examples=300, deadline=None, suppress_health_check=list(hypothesis.HealthCheck))
+
+    @needs_hypothesis
+    @_settings
+    @hypothesis.given(st.text(alphabet=st.sampled_from("0123456789abcdefABCDEF:.-x /?&=@eyJ,;"), max_size=40))
+    def test_redact_is_idempotent(text):
+        """Redacting a redacted line changes nothing: a line can safely pass through two handlers."""
+        once = redact(text)
+        assert redact(once) == once
+
+    @needs_hypothesis
+    @_settings
+    @hypothesis.given(st.text(max_size=8), st.ip_addresses(v=4), st.text(max_size=8))
+    def test_no_ipv4_survives_redact(pre, ip, post):
+        text = str(ip)
+        hypothesis.assume(not text.startswith(("127.", "0.")))
+        assert text not in redact(f"{pre} {text} {post}")
+
+    @needs_hypothesis
+    @_settings
+    @hypothesis.given(st.ip_addresses(v=6), st.text(alphabet="abcxyz ,.;", max_size=8))
+    def test_no_ipv6_survives_redact(ip, around):
+        hypothesis.assume(not (ip.is_loopback or ip.is_unspecified))
+        assert str(ip) not in redact(f"{around} {ip} {around}")
+
+
 def test_identifier_patterns(custom_patterns):
     register_identifier_pattern(r"device-[0-9a-f]{4}")
-    line = "connected to device-abcd at 192.168.1.10"
+    line = "connected to device-abcd at 192.0.2.10"
     assert redact(line) == "connected to [redacted] at x.x.x.10"
     # Identifier patterns are skipped when address redaction is disabled
-    assert redact_secrets(line) == "connected to device-abcd at 192.168.1.10"
+    assert redact_secrets(line) == "connected to device-abcd at 192.0.2.10"
     clear_identifier_patterns()
     assert redact(line) == "connected to device-abcd at x.x.x.10"
 
@@ -159,12 +243,12 @@ def test_identifier_patterns(custom_patterns):
 def test_custom_patterns(custom_patterns):
     register_custom_pattern(re.compile(r'("client-key":\s*")[^"]+'), r"\1***")
     register_custom_pattern(r"\bPIN (\d+)", lambda m: "PIN " + "#" * len(m.group(1)))  # a string compiles
-    line = 'register {"client-key": "a1b2c3d4"} PIN 1234 at 192.168.1.20'
-    assert redact_secrets(line) == 'register {"client-key": "***"} PIN #### at 192.168.1.20'
+    line = 'register {"client-key": "a1b2c3d4"} PIN 1234 at 192.0.2.20'
+    assert redact_secrets(line) == 'register {"client-key": "***"} PIN #### at 192.0.2.20'
     # Custom rules are secrets: the formatter applies them with addresses shown or hidden.
     record = logging.LogRecord("x", logging.INFO, __file__, 1, "%s", (line,), None)
     assert RedactingFormatter("%(message)s", addresses=False).format(record) == (
-        'register {"client-key": "***"} PIN #### at 192.168.1.20'
+        'register {"client-key": "***"} PIN #### at 192.0.2.20'
     )
     assert RedactingFormatter("%(message)s").format(record) == 'register {"client-key": "***"} PIN #### at x.x.x.20'
 
@@ -215,7 +299,7 @@ def test_setup_logging_redacts_to_stderr(root_logger, capsys):
     setup_logging(logging.INFO)
     assert len(root_logger.handlers) == 1 and root_logger.level == logging.INFO
     assert isinstance(root_logger.handlers[0].formatter, RedactingFormatter)
-    logging.getLogger("dev").info("reached %s with %s", "192.168.1.147", f"Bearer {JWT}")
+    logging.getLogger("dev").info("reached %s with %s", "192.0.2.147", f"Bearer {JWT}")
     logging.getLogger("dev").debug("below the level")
     out, err = capsys.readouterr()
     assert out == ""  # stdout belongs to the MCP stdio transport
@@ -224,8 +308,8 @@ def test_setup_logging_redacts_to_stderr(root_logger, capsys):
 
 def test_setup_logging_unredacted_still_hides_secrets(root_logger, capsys):
     setup_logging(logging.DEBUG, redacted=False, fmt="%(message)s")
-    logging.getLogger("dev").debug("reached %s?token=%s", "192.168.1.147", "abc")
-    assert capsys.readouterr().err == "reached 192.168.1.147?token=***\n"
+    logging.getLogger("dev").debug("reached %s?token=%s", "192.0.2.147", "abc")
+    assert capsys.readouterr().err == "reached 192.0.2.147?token=***\n"
 
 
 def test_setup_logging_replaces_handlers_rather_than_stacking(root_logger, capsys):
@@ -238,7 +322,7 @@ def test_setup_logging_replaces_handlers_rather_than_stacking(root_logger, capsy
 
 def test_formatter_datefmt():
     fmt = RedactingFormatter("%(asctime)s %(message)s", datefmt="%Y")
-    record = logging.LogRecord("x", logging.INFO, __file__, 1, "at %s", ("192.168.1.2",), None)
+    record = logging.LogRecord("x", logging.INFO, __file__, 1, "at %s", ("192.0.2.2",), None)
     out = fmt.format(record)
     assert out.endswith(" at x.x.x.2") and len(out.split()[0]) == 4
 
@@ -253,25 +337,25 @@ def test_secrets_are_always_redacted():
 
 
 def test_formatter_without_address_redaction_still_hides_secrets():
-    record = logging.LogRecord("x", logging.WARNING, __file__, 1, "Denied %s from %s", (JWT, "192.168.1.9"), None)
-    assert RedactingFormatter("%(message)s", addresses=False).format(record) == "Denied [jwt redacted] from 192.168.1.9"
+    record = logging.LogRecord("x", logging.WARNING, __file__, 1, "Denied %s from %s", (JWT, "192.0.2.9"), None)
+    assert RedactingFormatter("%(message)s", addresses=False).format(record) == "Denied [jwt redacted] from 192.0.2.9"
     assert RedactingFormatter("%(message)s").format(record) == "Denied [jwt redacted] from x.x.x.9"
 
 
 def test_tracebacks_are_redacted_too():
     try:
-        raise ConnectionError(f"connect to 192.168.1.147 failed, token {JWT}")
+        raise ConnectionError(f"connect to 192.0.2.147 failed, token {JWT}")
     except ConnectionError:
         import sys
 
         record = logging.LogRecord("x", logging.ERROR, __file__, 1, "boom", (), sys.exc_info())
     out = RedactingFormatter("%(message)s").format(record)
-    assert "192.168.1.147" not in out and JWT not in out and "x.x.x.147" in out
+    assert "192.0.2.147" not in out and JWT not in out and "x.x.x.147" in out
 
 
 def test_mask_ip():
     # IPv4 LAN addresses
-    assert mask_ip("192.168.1.60") == "x.x.x.60"
+    assert mask_ip("192.0.2.60") == "x.x.x.60"
     assert mask_ip("192.0.2.20") == "x.x.x.20"
     assert mask_ip("10.0.0.1") == "x.x.x.1"
     assert mask_ip("172.16.0.5") == "x.x.x.5"
@@ -281,6 +365,9 @@ def test_mask_ip():
     assert mask_ip("2001:0db8:85a3:0000:0000:8a2e:0370:7334") == "x:x::7334"
     assert mask_ip("fe80::1") == "x:x::1"
     assert mask_ip("fe80::1%eth0") == "x:x::1%eth0"
+    # Dotted IPv6 forms embed a whole IPv4 address after the last ":"; it must not come through whole
+    assert mask_ip("::ffff:192.0.2.5") == "x:x::x.x.x.5"
+    assert mask_ip("64:ff9b::192.0.2.5") == "x:x::x.x.x.5"
 
     # Loopback and unspecified preserved
     assert mask_ip("127.0.0.1") == "127.0.0.1"
@@ -298,24 +385,54 @@ def test_mask_ip():
 
 
 def test_mask_host_port():
-    assert mask_host_port("192.168.1.100:1883") == "x.x.x.100:1883"
+    assert mask_host_port("192.0.2.100:1883") == "x.x.x.100:1883"
     assert mask_host_port("192.0.2.20:5222") == "x.x.x.20:5222"
     assert mask_host_port("127.0.0.1:8000") == "127.0.0.1:8000"
     assert mask_host_port("localhost:1883") == "localhost:1883"
     assert mask_host_port("[2001:db8::1]:1883") == "[x:x::1]:1883"
     assert mask_host_port("[::1]:8000") == "[::1]:8000"
-    assert mask_host_port("192.168.1.100") == "x.x.x.100"
+    assert mask_host_port("192.0.2.100") == "x.x.x.100"
     assert mask_host_port("") == ""
 
 
 def test_mask_url():
-    assert mask_url("http://192.168.1.50:8480/") == "http://x.x.x.50:8480/"
-    url_with_query = "http://192.168.1.50:8480/api/v1?device=tv#section"
+    assert mask_url("http://192.0.2.50:8480/") == "http://x.x.x.50:8480/"
+    url_with_query = "http://192.0.2.50:8480/api/v1?device=tv#section"
     assert mask_url(url_with_query) == "http://x.x.x.50:8480/api/v1?device=tv#section"
-    assert mask_url("http://user:pass@192.168.1.50:8480/") == "http://user:pass@x.x.x.50:8480/"
+    assert mask_url("http://user:pass@192.0.2.50:8480/") == "http://user:pass@x.x.x.50:8480/"
     assert mask_url("http://[2001:db8::1]:8480/") == "http://[x:x::1]:8480/"
     assert mask_url("http://localhost:8480/") == "http://localhost:8480/"
     assert mask_url("http://127.0.0.1:8000/healthz") == "http://127.0.0.1:8000/healthz"
-    assert mask_url("mqtt://192.168.1.200:1883") == "mqtt://x.x.x.200:1883"
+    assert mask_url("mqtt://192.0.2.200:1883") == "mqtt://x.x.x.200:1883"
     assert mask_url("") == ""
     assert mask_url("not-a-url") == "not-a-url"
+    # A helper for log paths must never raise: urlsplit().port does for these, so the port text is
+    # kept as written and only the host is masked.
+    assert mask_url("http://192.0.2.5:abc/") == "http://x.x.x.5:abc/"
+    assert mask_url("http://192.0.2.5:70000/x") == "http://x.x.x.5:70000/x"
+    assert mask_url("http://[::ffff:192.0.2.5]:80/") == "http://[x:x::x.x.x.5]:80/"
+
+
+# hypothesis is optional for the siblings (it isn't in their dev dependencies): without it only
+# this test is skipped, never the module.
+try:
+    import hypothesis
+    import hypothesis.strategies as st
+except ImportError:  # pragma: no cover
+    hypothesis = None  # type: ignore[assignment]
+
+if hypothesis is not None:
+
+    @hypothesis.settings(max_examples=300, deadline=None, suppress_health_check=list(hypothesis.HealthCheck))
+    @hypothesis.given(st.ip_addresses(v=6))
+    def test_mask_ip_hides_every_ipv6_but_the_last_group(ip):
+        hypothesis.assume(not (ip.is_loopback or ip.is_unspecified))
+        masked = mask_ip(str(ip))
+        assert masked.startswith("x:x::")
+        if ip.ipv4_mapped is not None:  # the "::ffff:a.b.c.d" form
+            assert str(ip.ipv4_mapped) not in masked
+
+    @hypothesis.settings(max_examples=300, deadline=None, suppress_health_check=list(hypothesis.HealthCheck))
+    @hypothesis.given(st.text(alphabet=st.sampled_from("abc:/[]@?#.0123456789%"), max_size=30))
+    def test_mask_url_never_raises(tail):
+        mask_url("http://" + tail)

@@ -208,7 +208,7 @@ class KeyedTokenBucket:
 def refusal(what: str, wait: float, device: str | None = None) -> str:
     """The error message for a refused action.
 
-    For example: "Rate limit on Den: refusing to launch Contra (try again in
+    For example: "Rate limit on tv-1: refusing to launch Contra (try again in
     12s). This guards against runaway loops; ...".
 
     ``wait`` is what ``TokenBucket.take`` returned. The message says why the

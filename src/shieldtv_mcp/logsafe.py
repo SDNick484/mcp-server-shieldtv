@@ -8,14 +8,20 @@ log addresses freely, and tracebacks carry URLs and headers. So instead of
 editing messages one by one, the stderr handler's *formatter* redacts the
 final text, tracebacks included:
 
-    192.168.1.60                     -> x.x.x.60      (last octet kept, to tell devices apart)
+    192.0.2.60                     -> x.x.x.60      (last octet kept, to tell devices apart)
     2001:db8::1, fe80::1ff:fe00:1    -> x:x::1        (IPv6: last group kept, likewise)
     AA:BB:CC:DD:EE:FF                -> xx:xx:xx:xx:EE:FF
     AABBCCDDEEFF, 0009b0f76cfd       -> xxxxxxxxEEFF, xxxxxxxx6cfd  (bare hex, as in MQTT topics)
     mqtt://user:secret@host          -> mqtt://user:***@host
     http://host/x?token=abc&key=def  -> http://host/x?token=***&key=***
+    /cb?access_token=abc&code=def    -> /cb?access_token=***&code=***  (OAuth callbacks)
     eyJhbGciOi...(a JWT)             -> [jwt redacted]   (Cloudflare Access assertions)
     Authorization: Bearer abc123     -> Authorization: Bearer [redacted]
+    Authorization: Basic dXNlcjpwdw  -> Authorization: Basic [redacted]  (any scheme)
+    CF-Access-Client-Secret: 0a1b... -> CF-Access-Client-Secret: ***  (Access service tokens)
+    Cookie: CF_Authorization=abc     -> Cookie: CF_Authorization=[redacted]
+    {"client-key": "abc", "pin": "1"} -> {"client-key": "***", "pin": "***"}  (JSON and dict reprs)
+    MQTT_PASSWORD=hunter2            -> MQTT_PASSWORD=***  (.env / shell style)
     -----BEGIN PRIVATE KEY----- ...  -> [pem redacted]   (certificates and keys)
 
 Loopback and unspecified addresses (127.x, 0.0.0.0, ::1, ::) are left alone:
@@ -46,7 +52,7 @@ _IPV4 = re.compile(r"(?<![\d.])(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})(?!\d|\
 # eight-group forms both qualify), then ipaddress decides. That keeps the regex
 # readable and rejects look-alikes such as MACs (six groups, no "::") and
 # times ("10:23:45"). The lookarounds stop it starting or ending inside a
-# longer token, e.g. the IPv4 tail of "::ffff:192.168.1.5", which _IPV4 handles.
+# longer token, e.g. the IPv4 tail of "::ffff:192.0.2.5", which _IPV4 handles.
 # It may also start right after a label's colon ("ipv6:fe80::1"). That can only
 # matter where no match starts further left, and ipaddress still has to accept
 # what's left, so at worst it redacts the valid tail of a longer colon run.
@@ -56,15 +62,38 @@ _IPV6 = re.compile(r"(?:(?<![\w:.])|(?<=\w:))(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-
 _MAC = re.compile(r"(?<![0-9A-Fa-f:])((?:[0-9A-Fa-f]{2}[:-]){4})([0-9A-Fa-f]{2}[:-][0-9A-Fa-f]{2})(?![0-9A-Fa-f:])")
 _BARE_MAC = re.compile(r"(?<![0-9A-Za-z-])([0-9A-Fa-f]{8})([0-9A-Fa-f]{4})(?![0-9A-Za-z-])")
 _URL_PASSWORD = re.compile(r"(\w+://[^/\s:@?#]+):[^@/\s?#]+@")
+# The names whose value is a credential wherever they appear: as a query parameter, as a key in a
+# JSON object or a Python dict/headers repr, or as a header line. One vocabulary, so a name added
+# for one shape (an OAuth callback's ?access_token=) is caught in the others too. `pin` and `psk`
+# are the pairing secrets of TVs and hubs; the cf-access-client-* pair is a Cloudflare Access
+# service token (the id alone is harmless, but it's only ever logged next to the secret).
+_SECRET_NAMES = (
+    r"access[_-]?token|refresh[_-]?token|id[_-]?token|token|api[_-]?key|apikey|x-api-key|client[_-]?secret"
+    r"|client[_-]?key|secret|password|passwd|pass|pwd|pin|passcode|psk|pairing[_-]?key|auth|signature|sig"
+    r"|cf-access-client-secret|cf-access-client-id"
+)
 # Only directly after ? or &, so "monkey=1" or "access_token=" in prose don't count.
 # The value stops at quotes and brackets too, so a URL quoted in JSON keeps its closing quote.
-_QUERY_SECRET = re.compile(r"(?i)([?&](?:token|api_key|apikey|secret|key|password|pass)=)[^&#\s\"'<>()\[\]{}]+")
-_JSON_SECRET = re.compile(
-    r"""(?i)(["'](?:access_token|refresh_token|client_secret|client-key|api_key|apikey|password|secret)["']\s*:\s*["'])[^"']+(["'])"""
-)
+# `key` and `code` only here: ?key= and ?code= (an OAuth authorization code) carry credentials, but
+# "key" and "code" as JSON keys are usually a map key and a status.
+_QUERY_SECRET = re.compile(rf"(?i)([?&](?:{_SECRET_NAMES}|key|code)=)[^&#\s\"'<>()\[\]{{}}]+")
+_JSON_SECRET = re.compile(rf"""(?i)(["'](?:{_SECRET_NAMES})["']\s*:\s*["'])[^"']+(["'])""")
+# A header line or "Name: value" pair outside JSON ("CF-Access-Client-Secret: 0123..."). The value
+# runs to the end of the line or the next comma/semicolon, so a header dump redacts one value each.
+_HEADER_SECRET = re.compile(rf"(?im)^(\s*(?:{_SECRET_NAMES})\s*:\s*)[^\s,;][^,;\n]*")
+# Shell/.env style, as a sibling might log its environment at debug: MQTT_PASSWORD=..., CF_ACCESS_AUD stays.
+_ENV_SECRET = re.compile(r"(?m)(\b[A-Z][A-Z0-9_]*(?:PASSWORD|PASSWD|SECRET|TOKEN|API_KEY|PSK)=)(?!\s|$)[^\s]+")
+# Cloudflare Access's session cookie, in Cookie: and Set-Cookie: lines and in cookie-jar reprs.
+_CF_COOKIE = re.compile(r"(?i)(\bCF_Authorization=)[^;\s\"']+")
 # A JWT is three base64url parts; its header always starts with {" -> "eyJ".
 _JWT = re.compile(r"\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]*")
+# Any Authorization scheme, not just Bearer: Basic carries base64(user:password), Token/Digest/ApiKey
+# carry the credential outright. Only after "Authorization:" (or a dict key) for the generic schemes,
+# so the word "basic" in prose is left alone; a bare "Bearer <token>" is still caught anywhere.
 _BEARER = re.compile(r"(?i)(\bbearer\s+)[A-Za-z0-9._~+/=-]{8,}")
+_AUTHORIZATION = re.compile(
+    r"""(?i)(\b(?:proxy-)?authorization["']?\s*[:=]\s*["']?\s*(?:basic|digest|token|apikey|api-key|negotiate|ntlm|hoba|mutual|dpop|scram-sha-\d+)\s+)[^\s"',;]+"""
+)
 _PEM = re.compile(r"-----BEGIN [A-Z0-9 ]+-----.*?-----END [A-Z0-9 ]+-----", re.S)
 
 _Replacement = str | Callable[[re.Match[str]], str]
@@ -115,6 +144,20 @@ def clear_identifier_patterns() -> None:
     _IDENTIFIER_PATTERNS.clear()
 
 
+def mask_email(address: str) -> str:
+    """``user@example.com`` -> ``u***@example.com``: enough to tell identities apart, not enough to paste.
+
+    For messages that name an identity on purpose (an Access login that isn't on the
+    allow-list) rather than for ``redact()``, which leaves e-mail addresses alone: they
+    are rare in library output, and a server's own messages decide what they say.
+    Anything without an ``@`` comes back unchanged.
+    """
+    if not address or not isinstance(address, str) or "@" not in address:
+        return address
+    local, _, domain = address.partition("@")
+    return f"{local[:1]}***@{domain}"
+
+
 def mask_ip(address: str) -> str:
     """Mask an IPv4 or IPv6 address while preserving loopback, unspecified, and hostnames."""
     if not address or not isinstance(address, str):
@@ -127,7 +170,12 @@ def mask_ip(address: str) -> str:
         return address
     if isinstance(ip, ipaddress.IPv4Address):
         return f"x.x.x.{address.split('.')[-1]}"
+    # The text after the last ":" is the last hextet for "2001:db8::1", but for the dotted forms
+    # ("::ffff:192.0.2.5", "64:ff9b::192.0.2.5") it's a whole IPv4 address, which would leak the
+    # first three octets. Mask that embedded address the IPv4 way instead.
     tail = address.rsplit(":", 1)[1] if ":" in address else ""
+    if "." in tail:
+        return f"x:x::x.x.x.{tail.split('.')[-1]}"
     return f"x:x::{tail or '0'}"
 
 
@@ -169,7 +217,11 @@ def mask_url(url: str) -> str:
         userinfo = ""
         if "@" in netloc:
             userinfo = netloc.split("@", 1)[0] + "@"
-        port_part = f":{parsed.port}" if parsed.port is not None else ""
+        # parsed.port raises ValueError for a port that isn't a number or is out of range. This
+        # runs inside log formatting, where raising would lose the whole line, so keep whatever
+        # text follows the host instead (only the host is masked anyway).
+        host_and_port = netloc.rsplit("@", 1)[-1]
+        port_part = host_and_port[len(hostname) :] if host_and_port.lower().startswith(hostname) else ""
         host_repr = f"[{masked}]" if ":" in masked else masked
         netloc = f"{userinfo}{host_repr}{port_part}"
     return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
@@ -198,9 +250,13 @@ def redact_secrets(text: str) -> str:
     text = _PEM.sub("[pem redacted]", text)
     text = _JWT.sub("[jwt redacted]", text)
     text = _BEARER.sub(r"\1[redacted]", text)
+    text = _AUTHORIZATION.sub(r"\1[redacted]", text)
+    text = _CF_COOKIE.sub(r"\1[redacted]", text)
     text = _URL_PASSWORD.sub(r"\1:***@", text)
     text = _QUERY_SECRET.sub(r"\1***", text)
     text = _JSON_SECRET.sub(r"\1***\2", text)
+    text = _HEADER_SECRET.sub(r"\1***", text)
+    text = _ENV_SECRET.sub(r"\1***", text)
     for pattern, replacement in tuple(_CUSTOM_PATTERNS):
         text = pattern.sub(replacement, text)
     return text
