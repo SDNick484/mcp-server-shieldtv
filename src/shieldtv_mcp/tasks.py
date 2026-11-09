@@ -27,35 +27,58 @@ def _consume_abandoned_exception(task: asyncio.Task[Any]) -> None:
         task.exception()
 
 
-async def stop_task(task: asyncio.Task[Any] | None, timeout: float, what: str) -> None:
+# How long a cancelled task gets to wind down before it is cancelled again (see stop_tasks). Long
+# enough for the cleanups our workers do in `finally:` (an MQTT DISCONNECT and socket close, a
+# websocket close frame, `await client.aclose()`), short enough that a dropped cancel is retried
+# well inside the usual 5 s stop timeout.
+DEFAULT_GRACE = 1.0
+
+# How often the deadline is checked while waiting; independent of `grace`, so the total timeout
+# stays accurate when `grace` is longer than what's left of it.
+_POLL = 0.25
+
+
+async def stop_task(task: asyncio.Task[Any] | None, timeout: float, what: str, *, grace: float = DEFAULT_GRACE) -> None:
     """Cancel a background task and wait until it has finished, re-cancelling as needed, for at most `timeout`.
 
     Why not just `task.cancel(); await task`:
     - One cancel isn't always enough. On Python 3.11, asyncio.wait_for can return the awaited result and
       drop a cancellation that arrives in the same loop iteration (CPython PR #28149; fixed in 3.12). The
-      task carries on, and awaiting it hangs shutdown forever. So: cancel, wait briefly, cancel again until
-      it's done.
+      task carries on, and awaiting it hangs shutdown forever. So: cancel, wait `grace` seconds, cancel
+      again, until it's done.
+    - But not too eagerly: a second CancelledError lands wherever the task is awaiting, including inside
+      the `finally:` where it closes its connection. Re-cancelling every 0.25 s (as this once did) cut
+      off any cleanup that took longer than that. `grace` is how long a cancelled task gets to finish on
+      its own first; the default suits our workers' cleanups.
     - Bounded: a task that still won't exit is abandoned with a warning rather than hanging the server.
     - `asyncio.wait` never raises the task's own CancelledError into us, so a cancellation of *our*
       caller still propagates (suppressing CancelledError around `await task` swallowed both).
 
     The one-task case of `stop_tasks`, which does the work.
     """
-    await stop_tasks((task,), timeout, what)
+    await stop_tasks((task,), timeout, what, grace=grace)
 
 
-async def stop_tasks(tasks: Iterable[asyncio.Task[Any] | None], timeout: float, what: str = "background tasks") -> None:
+async def stop_tasks(
+    tasks: Iterable[asyncio.Task[Any] | None],
+    timeout: float,
+    what: str = "background tasks",
+    *,
+    grace: float = DEFAULT_GRACE,
+) -> None:
     """Stop several background tasks at once, the way `stop_task` stops one, within `timeout` *in total*.
 
     Calling `stop_task` on each in turn would make the worst case additive: three stubborn workers with
-    a 5 s timeout each hold shutdown for 15 s. Here every pending task is cancelled (and re-cancelled,
-    for the dropped-cancel case `stop_task` describes) on each round, and one `asyncio.wait` covers them
-    all, so they wind down in parallel and the whole call returns by `timeout`.
+    a 5 s timeout each hold shutdown for 15 s. Here every pending task is cancelled (and re-cancelled
+    after `grace` seconds, for the dropped-cancel case `stop_task` describes) together, and one
+    `asyncio.wait` covers them all, so they wind down in parallel and the whole call returns by `timeout`.
 
     `None`s are skipped (a worker that was never started). Tasks that had already finished aren't
     cancelled, but an exception they ended with is still logged, as for those stopped here: retrieving
     it is also what spares asyncio's "Task exception was never retrieved" at garbage collection.
     """
+    if grace < 0:
+        raise ValueError("grace must be 0 or more seconds")
     given = [t for t in tasks if t is not None]
     if not given:
         return
@@ -71,8 +94,10 @@ async def stop_tasks(tasks: Iterable[asyncio.Task[Any] | None], timeout: float, 
 
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
+    next_cancel = loop.time()  # the first cancel goes out at once
     while pending:
-        left = deadline - loop.time()
+        now = loop.time()
+        left = deadline - now
         if left <= 0:
             if single:
                 log.warning("%s didn't stop within %.0fs; abandoning it", what, timeout)
@@ -89,9 +114,13 @@ async def stop_tasks(tasks: Iterable[asyncio.Task[Any] | None], timeout: float, 
             for task in pending:
                 task.add_done_callback(_consume_abandoned_exception)
             return
-        for task in pending:
-            task.cancel()
-        done, pending = await asyncio.wait(pending, timeout=min(0.25, left))
+        if now >= next_cancel:
+            for task in pending:
+                task.cancel()
+            next_cancel = now + grace
+        # Wake at the next cancel, the deadline, or the poll interval, whichever is first: a task that
+        # finishes earlier ends the wait on its own.
+        done, pending = await asyncio.wait(pending, timeout=max(0.0, min(_POLL, left, next_cancel - now)))
         for task in done:
             if not task.cancelled() and task.exception() is not None:
                 log.debug("%s ended with %r", what, task.exception())
@@ -138,6 +167,8 @@ def spawn_task(
     return task
 
 
-async def stop_background_tasks(timeout: float = 5.0, what: str = "background tasks") -> None:
+async def stop_background_tasks(
+    timeout: float = 5.0, what: str = "background tasks", *, grace: float = DEFAULT_GRACE
+) -> None:
     """Cancel and wait for all currently running tasks started by ``spawn_task``."""
-    await stop_tasks(tuple(_BACKGROUND_TASKS), timeout, what)
+    await stop_tasks(tuple(_BACKGROUND_TASKS), timeout, what, grace=grace)

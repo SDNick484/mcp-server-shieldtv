@@ -81,8 +81,8 @@ def test_nonsense_settings_are_rejected(capacity, rate):
 
 
 def test_refusal_message():
-    msg = refusal("launch Contra", 11.6, device="Den")
-    assert msg.startswith("Rate limit on Den: refusing to launch Contra (try again in 12s).")
+    msg = refusal("launch Contra", 11.6, device="tv-1")
+    assert msg.startswith("Rate limit on tv-1: refusing to launch Contra (try again in 12s).")
     assert "runaway loops" in msg
     assert (
         refusal("press VolumeUp x30", float("inf"))
@@ -303,31 +303,31 @@ async def test_reserve_passes_timeouts_through_without_refunding():
 def test_keyed_buckets_are_independent():
     now = [0.0]
     k = KeyedTokenBucket(2, 1.0, clock=lambda: now[0])
-    assert k.take("den") == 0.0 and k.take("den") == 0.0
-    assert k.take("den") == pytest.approx(1.0)
-    assert k.take("living room", 2) == 0.0  # its own full bucket
+    assert k.take("tv-1") == 0.0 and k.take("tv-1") == 0.0
+    assert k.take("tv-1") == pytest.approx(1.0)
+    assert k.take("hub-1", 2) == 0.0  # its own full bucket
     now[0] = 1.0
-    assert k.take("den") == 0.0
+    assert k.take("tv-1") == 0.0
 
 
 def test_keyed_get_makes_one_bucket_per_key():
     k = KeyedTokenBucket(3, 0.5)
-    den = k.get("den")
-    assert k.get("den") is den and k.get("office") is not den
-    assert (den.capacity, den.rate) == (3, 0.5)
+    first = k.get("tv-1")
+    assert k.get("tv-1") is first and k.get("tv-2") is not first
+    assert (first.capacity, first.rate) == (3, 0.5)
 
 
 def test_keyed_refund():
     now = [0.0]
     k = KeyedTokenBucket(2, 1.0, lambda: now[0])
-    k.take("den", 2)
-    k.refund("den")
-    assert k.get("den").tokens == 1
-    assert k.get("office").tokens == 2  # untouched
-    k.refund("office", 5)
-    assert k.get("office").tokens == 2  # capped
+    k.take("tv-1", 2)
+    k.refund("tv-1")
+    assert k.get("tv-1").tokens == 1
+    assert k.get("tv-2").tokens == 2  # untouched
+    k.refund("tv-2", 5)
+    assert k.get("tv-2").tokens == 2  # capped
     with pytest.raises(ValueError):
-        k.refund("den", -1)
+        k.refund("tv-1", -1)
 
 
 @pytest.mark.anyio
@@ -340,15 +340,15 @@ async def test_keyed_acquire():
         now[0] += seconds
 
     k = KeyedTokenBucket(1, 0.5, lambda: now[0], sleep)  # clock and sleep positional too
-    assert await k.acquire("den") == 0.0
-    assert await k.acquire("office") == 0.0
-    assert await k.acquire("den") == pytest.approx(2.0)
+    assert await k.acquire("tv-1") == 0.0
+    assert await k.acquire("tv-2") == 0.0
+    assert await k.acquire("tv-1") == pytest.approx(2.0)
     assert sleeps == [pytest.approx(2.0)]
-    assert await k.acquire("office") == 0.0  # it refilled while den waited: one clock, separate buckets
+    assert await k.acquire("tv-2") == 0.0  # it refilled while tv-1 waited: one clock, separate buckets
     with pytest.raises(TimeoutError):
-        await k.acquire("office", timeout=1.0)
+        await k.acquire("tv-2", timeout=1.0)
     with pytest.raises(ValueError, match="cannot acquire more tokens than capacity"):
-        await k.acquire("den", 2)
+        await k.acquire("tv-1", 2)
 
 
 @pytest.mark.anyio
@@ -361,16 +361,16 @@ async def test_keyed_reserve():
         now[0] += seconds
 
     k = KeyedTokenBucket(2, 1.0, lambda: now[0], sleep)
-    k.take("den", 2)
-    async with k.reserve("den", 1, refund_on_error=True) as waited:
+    k.take("tv-1", 2)
+    async with k.reserve("tv-1", 1, refund_on_error=True) as waited:
         assert waited == pytest.approx(1.0)
-    assert k.take("den") == pytest.approx(1.0)  # spent
+    assert k.take("tv-1") == pytest.approx(1.0)  # spent
 
     with pytest.raises(ConnectionRefusedError):
-        async with k.reserve("den", 1, refund_on_error=True):
+        async with k.reserve("tv-1", 1, refund_on_error=True):
             raise ConnectionRefusedError
     # refunded
-    assert k.get("den").tokens == pytest.approx(1.0)
+    assert k.get("tv-1").tokens == pytest.approx(1.0)
 
 
 @pytest.mark.parametrize(

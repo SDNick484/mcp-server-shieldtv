@@ -14,6 +14,7 @@ speaks stdio has no use for remote.py):
     python scripts/sync_shared.py --check           exit 1 if any copy differs from the locked commit
     python scripts/sync_shared.py --check --latest  exit 1 if any copy differs from main instead
     ... --source DIR [--package NAME]               read a local mcp-server-shared checkout, not GitHub
+    ... --force                                     overwrite copies with uncommitted local changes
 
 `--source` is for trying a change to mcp-server-shared in a sibling before
 pushing it, and for mcp-server-shared itself, whose CI renders the shared
@@ -37,6 +38,19 @@ Why it works the way it does:
   that up). Raw files are fetched anonymously because raw.githubusercontent.com
   answers 404 to a token that can't see the repo, even a public one, and a
   workflow's own token is scoped to its own repo, not to mcp-server-shared.
+- Files are written atomically (to a temporary file beside the target, then renamed), so an
+  interrupted run can't leave a truncated module behind; `--check` would catch one, but only
+  on the next run.
+- The locked commit should be one `main` has pointed at. A PR branch's head is squash-merged
+  as a different SHA and then deleted; raw.githubusercontent.com keeps serving the old one
+  for a while, so a lock pointing at it looks fine until GitHub garbage-collects it. `--check`
+  (and a plain sync) asks the API whether the lock is on main's history and warns if not;
+  that check is advisory and never fails the run (the API may be rate limited or offline).
+- A copy with uncommitted changes isn't overwritten unless --force is given. Hand-editing
+  a copy is against the rules, but it happens while debugging, and a sync that silently
+  threw the edit away left nothing to recover it from (`git diff` then shows upstream's
+  change, not yours). The check uses `git status --porcelain` and is skipped when the
+  repo isn't a git checkout or git isn't installed, so the script still runs anywhere.
 - Siblings opt out of a module (`exclude = ["remote"]`) rather than opt in, so
   a newly shared module reaches every sibling by default, and a sibling that
   doesn't want it says so on purpose. Exclusion is by module, not by path, so
@@ -50,6 +64,7 @@ import argparse
 import ast
 import contextlib
 import difflib
+import json
 import os
 import re
 import shutil
@@ -102,8 +117,12 @@ class Lock:
     package: str
     exclude: tuple[str, ...] = ()  # shared modules this repo doesn't take
 
+    KEYS = ("repo", "commit", "package", "exclude")  # what read_lock understands; anything else is a typo
+
     def validate(self) -> Lock:
-        if not _REPO.fullmatch(self.repo):
+        # The regex allows "." and "-" (real repo names have them), but a segment that *is* "." or ".."
+        # would turn the raw.githubusercontent.com URL into a path walk; refuse it here.
+        if not _REPO.fullmatch(self.repo) or any(part in (".", "..") for part in self.repo.split("/")):
             raise SyncError(f"{LOCK}: repo must look like owner/name (got {self.repo!r})")
         if not _SHA.fullmatch(self.commit):
             raise SyncError(f"{LOCK}: commit must be a full 40-character SHA (got {self.commit!r})")
@@ -129,6 +148,15 @@ def read_lock(root: Path) -> Lock:
         raise SyncError(f"no {LOCK} in {root}; see mcp-server-shared's README for how to add one") from None
     except tomllib.TOMLDecodeError as exc:
         raise SyncError(f"{LOCK} isn't valid TOML: {exc}") from None
+    unknown = sorted(set(data) - set(Lock.KEYS))
+    if unknown:
+        # Not an error (an older script must still read a lock a newer one wrote), but a misspelt
+        # `excludes = [...]` silently excluding nothing would bring remote.py into a stdio-only server.
+        print(
+            f"sync_shared.py: warning: {LOCK} has keys this script doesn't use: {', '.join(unknown)} "
+            f"(it reads {', '.join(Lock.KEYS)})",
+            file=sys.stderr,
+        )
     exclude = data.get("exclude", [])
     if not isinstance(exclude, list) or not all(isinstance(name, str) for name in exclude):
         raise SyncError(f'{LOCK}: exclude must be a list of module names, like ["remote"] (got {exclude!r})')
@@ -200,6 +228,45 @@ def resolve_main(repo: str) -> str:
     if not _SHA.fullmatch(sha):
         raise SyncError(f"GitHub returned {sha[:60]!r} for {repo} main, not a commit SHA")
     return sha
+
+
+def lock_is_on_main(repo: str, commit: str) -> str | None:
+    """None if `commit` is on main's history (main itself or an ancestor), else a one-line explanation.
+
+    GitHub's compare endpoint says how `commit` relates to main: "identical" or "behind" (an ancestor:
+    fine), "ahead" or "diverged" (a commit main never pointed at, typically a PR branch's head that was
+    squash-merged and deleted), or 404 (gone). Advisory: a rate limit or no network is reported as a
+    reason the check couldn't run, and the caller treats that as "don't know", not as a failure.
+    """
+    url = f"https://api.github.com/repos/{repo}/compare/main...{commit}"
+    try:
+        data = json.loads(_get(url, "application/vnd.github+json"))
+    except SyncError as exc:
+        text = str(exc)
+        if " HTTP 404 " in text:
+            return (
+                f"the locked commit {commit[:7]} is not in {repo} at all (deleted branch or rewritten history?)."
+                " Run `python scripts/sync_shared.py --update` to move the lock to a commit on main."
+            )
+        return f"couldn't check whether the locked commit is on main ({text.removeprefix('GET ' + url + ': ')})"
+    except ValueError:
+        return "couldn't check whether the locked commit is on main (GitHub returned something that isn't JSON)"
+    status = data.get("status") if isinstance(data, dict) else None
+    if status in ("identical", "behind"):
+        return None
+    if status in ("ahead", "diverged"):
+        return (
+            f"the locked commit {commit[:7]} is not on {repo} main ({status}). A PR branch's head is squash-merged as "
+            "a different SHA and then deleted, and GitHub stops serving the old one eventually. Run "
+            "`python scripts/sync_shared.py --update` to move the lock to main."
+        )
+    return f"couldn't check whether the locked commit is on main (unexpected compare status {status!r})"
+
+
+def _warn_if_lock_is_off_main(lock: Lock) -> None:
+    reason = lock_is_on_main(lock.repo, lock.commit)
+    if reason:
+        print(f"sync_shared.py: warning: {reason}", file=sys.stderr)
 
 
 @dataclass
@@ -304,7 +371,7 @@ def wanted_files(
         if not self_path.is_relative_to(root_resolved):
             raise SyncError(f"refusing to write {SELF}: resolves outside {root}")
         self_path.parent.mkdir(parents=True, exist_ok=True)
-        self_path.write_bytes(new_script)
+        write_atomic(self_path, new_script)
         raise SyncError(f"Updated {SELF} for {MANIFEST} format {fmt}. Run the same command again.")
     # A typo ("remot") would otherwise exclude nothing, silently. So would a module that was renamed
     # or dropped in mcp-server-shared: then this lock's exclude is out of date and should say so.
@@ -330,6 +397,26 @@ def wanted_files(
 
 
 # --- comparing and writing ------------------------------------------------------------------
+def write_atomic(path: Path, data: bytes) -> None:
+    """Write `data` to `path` so that readers see either the old file or the new one, never a partial.
+
+    The bytes go to a temporary file in the same directory (same filesystem, so the rename is
+    atomic), are flushed to disk, then renamed over the target. A crash or Ctrl-C mid-write
+    leaves the old file in place and at worst a stray `.<name>.tmp-<pid>` to delete.
+    """
+    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
+
+
 def differences(root: Path, files: dict[str, bytes]) -> list[tuple[str, str]]:
     """(target, "differs" | "missing") for every copy that doesn't match, in manifest order."""
     found = []
@@ -342,18 +429,61 @@ def differences(root: Path, files: dict[str, bytes]) -> list[tuple[str, str]]:
     return found
 
 
-def write_files(root: Path, files: dict[str, bytes], *, dry_run: bool = False) -> list[str]:
-    """Write the copies that differ; return their paths. Unchanged files are left alone (and their mtimes)."""
+def locally_modified(root: Path, targets: list[str]) -> list[str]:
+    """Which of `targets` have uncommitted changes in the git checkout at `root` (tracked and modified,
+    or staged). [] when `root` isn't in a git work tree or git isn't available: then there's nothing to
+    compare against, and the sync proceeds as it always has."""
+    if not targets or not shutil.which("git"):
+        return []
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(root), "status", "--porcelain", "--untracked-files=no", "--", *targets],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if out.returncode != 0:  # not a git repo, or git is unhappy: don't guess
+        return []
+    modified = []
+    for line in out.stdout.splitlines():
+        # Porcelain v1: two status columns, a space, then the path (quoted if it has odd characters;
+        # ours never do). A rename shows "old -> new"; we only match on the new name.
+        path = line[3:].split(" -> ")[-1].strip().strip('"')
+        if path in targets:
+            modified.append(path)
+    return [t for t in targets if t in modified]  # manifest order
+
+
+def write_files(root: Path, files: dict[str, bytes], *, dry_run: bool = False, force: bool = False) -> list[str]:
+    """Write the copies that differ; return their paths. Unchanged files are left alone (and their mtimes).
+
+    A copy that differs *and* has uncommitted local changes is refused (SyncError naming it) unless
+    `force`: overwriting it would destroy an edit the user has nowhere else. A dry run reports instead.
+    """
     changed = []
     root_resolved = root.resolve()
-    for target, status in differences(root, files):
+    found = differences(root, files)
+    dirty = locally_modified(root, [t for t, status in found if status == "differs"])
+    if dirty and not force and not dry_run:
+        raise SyncError(
+            f"refusing to overwrite {len(dirty)} shared cop{'y' if len(dirty) == 1 else 'ies'} with uncommitted "
+            f"local changes: {', '.join(dirty)}. Shared files are changed in mcp-server-shared, not here: move "
+            "the edit there (or `git stash` / `git checkout --` it), then run this again; `--force` overwrites."
+        )
+    for target, status in found:
         if not dry_run:
             path = (root_resolved / target).resolve()
             if not path.is_relative_to(root_resolved):
                 raise SyncError(f"refusing to write {target}: resolves outside {root}")
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(files[target])  # bytes, so no newline translation: copies stay byte-identical
-        changed.append(f"{target} ({'added' if status == 'missing' else 'updated'})")
+            write_atomic(path, files[target])  # bytes, so no newline translation: copies stay byte-identical
+        note = "added" if status == "missing" else "updated"
+        if target in dirty:
+            note += ", had uncommitted local changes" + ("" if dry_run else "; overwritten (--force)")
+        changed.append(f"{target} ({note})")
     return changed
 
 
@@ -448,6 +578,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--update", action="store_true", help="move shared.lock to mcp-server-shared main first")
     parser.add_argument("--check", action="store_true", help="don't write; exit 1 if any copy differs")
     parser.add_argument("--dry-run", action="store_true", help="show what would change without writing files or lock")
+    parser.add_argument("--force", action="store_true", help="overwrite shared copies with uncommitted local changes")
     parser.add_argument("--latest", action="store_true", help="with --check: compare against main, not the lock")
     parser.add_argument("--source", type=Path, help="read files from this local mcp-server-shared checkout")
     parser.add_argument("--package", help="package name for __PKG__ (default: from shared.lock)")
@@ -464,6 +595,8 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         parser.error("--latest only goes with --check (to move to main and write, use --update)")
     if args.update and args.check:
         parser.error("--update writes; use --check --latest to compare against main without writing")
+    if args.force and (args.check or args.dry_run):
+        parser.error("--force only matters when writing; --check and --dry-run never write")
     if args.source and (args.update or args.latest):
         parser.error("--source reads a local checkout, which has no lock or main to move to")
     if args.package is not None and not _PACKAGE.fullmatch(args.package):
@@ -478,6 +611,7 @@ def _excluding(exclude: tuple[str, ...]) -> str:
 def run(args: argparse.Namespace) -> int:
     root: Path = args.root
     dry_run: bool = bool(getattr(args, "dry_run", False))
+    force: bool = bool(getattr(args, "force", False))
 
     if args.source:
         # mcp-server-shared itself renders its tests with --package and has no lock; a sibling
@@ -492,7 +626,7 @@ def run(args: argparse.Namespace) -> int:
             status = report(root, files, label, f"python scripts/sync_shared.py --source {args.source}")
             _report_orphans(root, package, files, exclude)
             return status
-        changed = write_files(root, files, dry_run=dry_run)
+        changed = write_files(root, files, dry_run=dry_run, force=force)
         prefix = f"dry run, would sync from {label}" if dry_run else f"synced from {label}"
         print(f"{prefix}: " + (", ".join(changed) if changed else "nothing to change"))
         _report_orphans(root, package, files, exclude)
@@ -518,16 +652,17 @@ def run(args: argparse.Namespace) -> int:
         files = wanted_files(source, package, writing=False, root=root, exclude=exclude)
         status = report(root, files, source.label + _excluding(exclude), "python scripts/sync_shared.py")
         _report_orphans(root, package, files, exclude)
+        _warn_if_lock_is_off_main(lock)
         return status
 
     if args.update:
         main = resolve_main(lock.repo)
         source = GitHub(lock.repo, main, "main")
         files = wanted_files(source, package, writing=not dry_run, root=root, exclude=exclude)
-        changed = write_files(root, files, dry_run=dry_run)
+        changed = write_files(root, files, dry_run=dry_run, force=force)
         new_lock = Lock(lock.repo, main, lock.package, lock.exclude)  # exclude carries over unchanged
         if new_lock != lock and not dry_run:
-            (root / LOCK).write_text(new_lock.dump(), encoding="utf-8")  # last: only once every file is in
+            write_atomic(root / LOCK, new_lock.dump().encode("utf-8"))  # last: only once every file is in
         moved = f"{lock.commit[:7]} -> {main[:7]}" if main != lock.commit else f"already at {main[:7]}"
         prefix = "dry run, shared.lock" if dry_run else "shared.lock"
         print(f"{prefix}: {moved}{_excluding(exclude)}; " + (", ".join(changed) if changed else "no files changed"))
@@ -536,11 +671,12 @@ def run(args: argparse.Namespace) -> int:
 
     source = GitHub(lock.repo, lock.commit, "locked")
     files = wanted_files(source, package, writing=not dry_run, root=root, exclude=exclude)
-    changed = write_files(root, files, dry_run=dry_run)
+    changed = write_files(root, files, dry_run=dry_run, force=force)
     label = source.label + _excluding(exclude)
     prefix = f"dry run, would sync from {label}" if dry_run else f"synced from {label}"
     print(f"{prefix}: " + (", ".join(changed) if changed else "nothing to change"))
     _report_orphans(root, package, files, exclude)
+    _warn_if_lock_is_off_main(lock)
     return 1 if (dry_run and changed) else 0
 
 
