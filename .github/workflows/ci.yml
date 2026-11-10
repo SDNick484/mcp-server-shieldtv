@@ -11,16 +11,30 @@ on:
       timezone: America/Los_Angeles  # 8 a.m. Pacific all year, across daylight saving
   workflow_dispatch:  # a "Run workflow" button: also runs the --latest check
 
+# The token gets nothing it doesn't need: these jobs only read the checkout.
+permissions:
+  contents: read
+
+# One run per branch and event. A push to a PR branch cancels that PR's previous run; pushes to main
+# and the weekly schedule queue instead, so a merge can't cancel the schedule's --latest check.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Actions are pinned to a commit, not a tag: a tag can be moved. The comment is the version the SHA
+# was taken from; Dependabot (.github/dependabot.yml) bumps both together.
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ matrix.python-version }}
       - run: pip install -e ".[dev]"
@@ -31,21 +45,12 @@ jobs:
 
   alpine:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: docker run --rm -v "$PWD:/src" -w /src python:3.12-alpine sh deploy/alpine/smoke-test.sh
 
+  # The job itself lives in mcp-server-shared (.github/workflows/shared-drift.yml): it runs this
+  # repo's own scripts/sync_shared.py, so the check is the one this repo's lock pins.
   shared-drift:
-    runs-on: ubuntu-latest
-    env:
-      GITHUB_TOKEN: ${{ github.token }}  # for api.github.com's rate limit; raw files are fetched without it
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.11"  # the oldest supported: keeps the stdlib-only script honest
-      - name: Shared files match the locked commit
-        run: python scripts/sync_shared.py --check
-      - name: Shared files match mcp-server-shared main
-        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-        run: python scripts/sync_shared.py --check --latest
+    uses: SDNick484/mcp-server-shared/.github/workflows/shared-drift.yml@5f9b824fb1ab1f5e8db1196980125355d5293a5a # v0.1.1
