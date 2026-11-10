@@ -20,6 +20,11 @@ respawn_delay=5
 respawn_max=10
 respawn_period=300
 
+# Stopping: SIGTERM, up to 15 s to shut down cleanly, then SIGKILL (OpenRC's default is SIGTERM/5).
+# Shutdown takes about 2 s (uvicorn's drain, then the Shield connection closes), so 15 s is headroom.
+# supervise-daemon reads this at start: the restart that installs it still stops the old way.
+retry="SIGTERM/15/SIGKILL/5"
+
 depend() {
 	need net
 	after firewall
