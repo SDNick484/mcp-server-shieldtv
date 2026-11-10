@@ -1,0 +1,21 @@
+# Dependabot keeps the pinned action SHAs in .github/workflows/ and the dependency bounds in
+# pyproject.toml current. Weekly and grouped: at most one PR per ecosystem on a Monday. The shared
+# modules' bounds (mcp, pyjwt, uvicorn) follow mcp-server-shared: take those bumps there first.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      actions:
+        patterns: ["*"]
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      python:
+        patterns: ["*"]
