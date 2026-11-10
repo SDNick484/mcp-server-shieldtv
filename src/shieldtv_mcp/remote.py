@@ -250,11 +250,28 @@ class AccessVerifier:
         self.policy = policy
         if key_resolver is None:
             client = jwt.PyJWKClient(policy.certs_url, cache_jwk_set=True, lifespan=3600, timeout=10)
+            # One lock around the whole lookup, network fetch included, so every verification waits
+            # while a refetch is in flight (up to the 10 s timeout). That is the point: a burst of
+            # tokens naming a key we don't have yet makes one fetch, not one each. Fetches are rare
+            # (cache expiry, key rotation), and a hit in the cache holds the lock for microseconds.
             lock = anyio.Lock()
+            # When PyJWKClient last went to the network, successful or not: the throttle below
+            # counts fetches, so a steady stream of tokens served from the cache must not move it,
+            # or a rotated key would be refused until the cache expired. fetch_data is the one
+            # method that does network I/O, so wrapping it on this instance catches every fetch.
             last_fetch: float | None = None
+            fetch_data = client.fetch_data
 
-            async def resolve(token: str) -> Any:  # pragma: no cover
+            def fetch_and_record() -> Any:
                 nonlocal last_fetch
+                try:
+                    return fetch_data()
+                finally:
+                    last_fetch = time.monotonic()
+
+            client.fetch_data = fetch_and_record  # type: ignore[method-assign]
+
+            async def resolve(token: str) -> Any:
                 async with lock:
                     header = jwt.get_unverified_header(token)
                     kid = header.get("kid")
@@ -269,10 +286,7 @@ class AccessVerifier:
                                 and (now - last_fetch) < self.min_refetch_interval
                             ):
                                 raise jwt.PyJWKClientError(f"Unable to find a signing key that matches {kid!r}")
-                    try:
-                        key = await anyio.to_thread.run_sync(client.get_signing_key_from_jwt, token)
-                    finally:
-                        last_fetch = time.monotonic()
+                    key = await anyio.to_thread.run_sync(client.get_signing_key_from_jwt, token)
                 return key.key
 
             key_resolver = resolve
@@ -296,8 +310,9 @@ class AccessVerifier:
             email = str(claims.get("email", "")).lower()
             if email not in self.policy.emails:
                 # The identity is somebody Access let through but this server doesn't want; name it
-                # only enough to tell logins apart. logsafe doesn't redact e-mail addresses (and this
-                # module can't import it: shared modules stay self-contained), so mask it here.
+                # only enough to tell logins apart. logsafe's redact() would mask it in a log line, but
+                # not with redaction off, and this module can't import logsafe's mask_email (shared
+                # modules stay self-contained), so mask it here the same way.
                 local, _, domain = email.partition("@")
                 shown = f"{local[:1]}***@{domain}" if domain else "this identity"
                 raise AccessDenied(f"{shown} is not in MCP_ALLOWED_EMAILS")

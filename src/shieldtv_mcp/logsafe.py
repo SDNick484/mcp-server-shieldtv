@@ -12,6 +12,7 @@ final text, tracebacks included:
     2001:db8::1, fe80::1ff:fe00:1    -> x:x::1        (IPv6: last group kept, likewise)
     AA:BB:CC:DD:EE:FF                -> xx:xx:xx:xx:EE:FF
     AABBCCDDEEFF, 0009b0f76cfd       -> xxxxxxxxEEFF, xxxxxxxx6cfd  (bare hex, as in MQTT topics)
+    user@example.com                 -> u***@example.com  (domain kept: it says which IdP)
     mqtt://user:secret@host          -> mqtt://user:***@host
     http://host/x?token=abc&key=def  -> http://host/x?token=***&key=***
     /cb?access_token=abc&code=def    -> /cb?access_token=***&code=***  (OAuth callbacks)
@@ -26,6 +27,9 @@ final text, tracebacks included:
 
 Loopback and unspecified addresses (127.x, 0.0.0.0, ::1, ::) are left alone:
 they say nothing about your network and matter when debugging the simulator.
+So are things shaped like an e-mail address that aren't one: URL userinfo
+(ssh://git@host, mqtt://user:***@host), scp-style remotes (git@github.com:x),
+decorators, and hosts without a letters-only TLD (user@localhost, admin@10.0.0.1).
 
 Each server's CLI turns redaction off with --no-redact or its
 <NAME>_LOG_UNREDACTED=1, e.g. when you are the only reader. Secrets (JWTs,
@@ -61,7 +65,17 @@ _IPV6 = re.compile(r"(?:(?<![\w:.])|(?<=\w:))(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-
 # groups out of a longer colon run such as an eight-group IPv6 address.
 _MAC = re.compile(r"(?<![0-9A-Fa-f:])((?:[0-9A-Fa-f]{2}[:-]){4})([0-9A-Fa-f]{2}[:-][0-9A-Fa-f]{2})(?![0-9A-Fa-f:])")
 _BARE_MAC = re.compile(r"(?<![0-9A-Za-z-])([0-9A-Fa-f]{8})([0-9A-Fa-f]{4})(?![0-9A-Za-z-])")
-_URL_PASSWORD = re.compile(r"(\w+://[^/\s:@?#]+):[^@/\s?#]+@")
+# An e-mail address. The local part can't start inside a longer token (the first lookbehind) or
+# right after "://", where "user@host" is URL userinfo, not an address. The domain needs a
+# letters-only TLD, so "user@localhost" and "admin@10.0.0.1" don't count, and it can't be followed
+# by ":" and a non-space, which is an scp-style git remote (git@github.com:owner/repo). Possessive
+# quantifiers (++) because a log line can hold a long token: no backtracking into it.
+_EMAIL = re.compile(
+    r"(?<![\w.%+-])(?<!://)([A-Za-z0-9._%+-]++)@((?:[A-Za-z0-9-]++\.)+[A-Za-z]{2,63})(?![A-Za-z0-9-]|\.[A-Za-z0-9]|:\S)"
+)
+# Anchored at the start of a word: unanchored, a long run of word characters (a hex or base64 blob)
+# was rescanned from every offset, quadratic in the length of the line (20 s for 100 KB).
+_URL_PASSWORD = re.compile(r"(?<!\w)(\w++://[^/\s:@?#]+):[^@/\s?#]+@")
 # The names whose value is a credential wherever they appear: as a query parameter, as a key in a
 # JSON object or a Python dict/headers repr, or as a header line. One vocabulary, so a name added
 # for one shape (an OAuth callback's ?access_token=) is caught in the others too. `pin` and `psk`
@@ -147,10 +161,9 @@ def clear_identifier_patterns() -> None:
 def mask_email(address: str) -> str:
     """``user@example.com`` -> ``u***@example.com``: enough to tell identities apart, not enough to paste.
 
-    For messages that name an identity on purpose (an Access login that isn't on the
-    allow-list) rather than for ``redact()``, which leaves e-mail addresses alone: they
-    are rare in library output, and a server's own messages decide what they say.
-    Anything without an ``@`` comes back unchanged.
+    ``redact()`` applies this to every address it finds in a log line; call it directly
+    for text that isn't logged (an error returned to a client) or that is logged
+    with address redaction off. Anything without an ``@`` comes back unchanged.
     """
     if not address or not isinstance(address, str) or "@" not in address:
         return address
@@ -266,6 +279,7 @@ def redact(text: str) -> str:
     text = redact_secrets(text)
     for pattern, replacement in tuple(_IDENTIFIER_PATTERNS):
         text = pattern.sub(replacement, text)
+    text = _EMAIL.sub(lambda m: mask_email(m.group(0)), text)
     # IPv6 before MACs: an eight-group address of two-digit groups is an address, not a MAC.
     text = _IPV6.sub(_ipv6, text)
     text = _IPV4.sub(_ip, text)
