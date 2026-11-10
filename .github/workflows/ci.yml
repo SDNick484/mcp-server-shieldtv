@@ -50,18 +50,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: docker run --rm -v "$PWD:/src" -w /src python:3.12-alpine sh deploy/alpine/smoke-test.sh
 
+  # The job itself lives in mcp-server-shared (.github/workflows/shared-drift.yml): it runs this
+  # repo's own scripts/sync_shared.py, so the check is the one this repo's lock pins.
   shared-drift:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    env:
-      GITHUB_TOKEN: ${{ github.token }}  # for api.github.com's rate limit; raw files are fetched without it
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
-        with:
-          python-version: "3.11"  # the oldest supported: keeps the stdlib-only script honest
-      - name: Shared files match the locked commit
-        run: python scripts/sync_shared.py --check
-      - name: Shared files match mcp-server-shared main
-        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-        run: python scripts/sync_shared.py --check --latest
+    uses: SDNick484/mcp-server-shared/.github/workflows/shared-drift.yml@9449e9fc66db4c1594e018cdc92928002347cac9 # v0.1.0
