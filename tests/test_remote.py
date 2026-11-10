@@ -490,9 +490,13 @@ async def test_jwks_dos_protection_throttles_unknown_kid(monkeypatch):
         def __init__(self, *args: object, **kwargs: object) -> None:
             self.jwk_set_cache = FakeCache(FakeJWKSet([FakeKey("known-kid")]))
 
-        def get_signing_key_from_jwt(self, _token: str) -> object:
+        def fetch_data(self) -> object:
             nonlocal calls
             calls += 1
+            return {"keys": []}
+
+        def get_signing_key_from_jwt(self, _token: str) -> object:
+            self.fetch_data()  # as PyJWKClient does on an unknown kid
             raise jwt.PyJWKClientError("unknown kid")
 
     monkeypatch.setattr(jwt, "PyJWKClient", FakePyJWKClient)
@@ -526,3 +530,42 @@ async def test_jwks_dos_protection_throttles_unknown_kid(monkeypatch):
     with pytest.raises(remote.AccessDenied, match="unknown kid"):
         await verifier.verify(tok3)
     assert calls == 2
+
+
+@pytest.mark.anyio
+async def test_jwks_throttle_counts_network_fetches_not_cache_hits(monkeypatch):
+    # The real PyJWKClient, with only its HTTP request faked. Tokens served from the cache must not
+    # count as fetches: if they did, steady traffic on the old key would keep a rotated key refused
+    # until the cache expired.
+    jwk = jwt.algorithms.RSAAlgorithm.to_jwk(KEY.public_key(), as_dict=True)
+    published = [{**jwk, "kid": "old-kid", "use": "sig"}]
+    fetches = 0
+
+    def fetch_data(self: jwt.PyJWKClient) -> object:
+        nonlocal fetches
+        fetches += 1
+        return {"keys": list(published)}
+
+    monkeypatch.setattr(jwt.PyJWKClient, "fetch_data", fetch_data)
+    fake_now = [1000.0]
+    monkeypatch.setattr(time, "monotonic", lambda: fake_now[0])
+    verifier = remote.AccessVerifier(POLICY)
+
+    def signed(kid: str) -> str:
+        now = int(time.time())
+        claims = {"iss": f"https://{TEAM}", "aud": [AUD], "iat": now, "exp": now + 300, "email": "user@example.com"}
+        return jwt.encode(claims, KEY, algorithm="RS256", headers={"kid": kid})
+
+    await verifier.verify(signed("old-kid"))  # empty cache: one fetch
+    assert fetches == 1
+
+    fake_now[0] = 1100.0
+    await verifier.verify(signed("old-kid"))  # a cache hit: no fetch
+    assert fetches == 1
+
+    # Cloudflare rotates: the new kid is 10 s after the last cache hit but 110 s after the last
+    # fetch, so it is fetched, not throttled.
+    published.append({**jwk, "kid": "new-kid", "use": "sig"})
+    fake_now[0] = 1110.0
+    await verifier.verify(signed("new-kid"))
+    assert fetches == 2

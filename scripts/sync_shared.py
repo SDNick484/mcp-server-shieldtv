@@ -96,12 +96,17 @@ DIFF_LINES = 40  # per file, in --check output
 _SHA = re.compile(r"[0-9a-f]{40}")
 _REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _PACKAGE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# A release tag of mcp-server-shared, as the lock's `version` carries it: v0.1.0, v1.2.0-rc1. Strict
+# on purpose: it is written into the lock's TOML as is, and anything else on a commit (a
+# moving tag, a typo) isn't a version.
+_VERSION = re.compile(r"v(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.]+))?")
 
 LOCK_HEADER = """\
 # Which mcp-server-shared commit this repo's shared files come from, and this
 # repo's package name (it replaces __PKG__). Written by
-# `python scripts/sync_shared.py --update`; see that script. An optional
-# `exclude = ["remote"]` names shared modules this repo doesn't take.
+# `python scripts/sync_shared.py --update`; see that script. `version`, when
+# present, is the tag on that commit: a label only, the commit is the pin. An
+# optional `exclude = ["remote"]` names shared modules this repo doesn't take.
 """
 
 
@@ -116,8 +121,11 @@ class Lock:
     commit: str
     package: str
     exclude: tuple[str, ...] = ()  # shared modules this repo doesn't take
+    version: str | None = None  # the release tag on `commit`, if it has one (written by --update)
 
-    KEYS = ("repo", "commit", "package", "exclude")  # what read_lock understands; anything else is a typo
+    # What read_lock understands; anything else is a typo. "version" was added after "exclude": a
+    # script from before it warns about the key and otherwise ignores it.
+    KEYS = ("repo", "commit", "version", "package", "exclude")
 
     def validate(self) -> Lock:
         # The regex allows "." and "-" (real repo names have them), but a segment that *is* "." or ".."
@@ -131,10 +139,20 @@ class Lock:
         for name in self.exclude:
             if not _PACKAGE.fullmatch(name):
                 raise SyncError(f'{LOCK}: exclude must list module names like "remote" (got {name!r})')
+        if self.version is not None and not _VERSION.fullmatch(self.version):
+            raise SyncError(f'{LOCK}: version must be a tag like "v0.1.0" (got {self.version!r})')
         return self
 
+    @property
+    def at(self) -> str:
+        """For messages: "1a2b3c4" or "1a2b3c4 (v0.1.0)"."""
+        return _at(self.commit, self.version)
+
     def dump(self) -> str:
-        text = f'{LOCK_HEADER}repo = "{self.repo}"\ncommit = "{self.commit}"\npackage = "{self.package}"\n'
+        text = f'{LOCK_HEADER}repo = "{self.repo}"\ncommit = "{self.commit}"\n'
+        if self.version:
+            text += f'version = "{self.version}"\n'
+        text += f'package = "{self.package}"\n'
         if self.exclude:
             text += "exclude = [" + ", ".join(f'"{name}"' for name in self.exclude) + "]\n"
         return text
@@ -160,12 +178,16 @@ def read_lock(root: Path) -> Lock:
     exclude = data.get("exclude", [])
     if not isinstance(exclude, list) or not all(isinstance(name, str) for name in exclude):
         raise SyncError(f'{LOCK}: exclude must be a list of module names, like ["remote"] (got {exclude!r})')
+    version = data.get("version")
+    if version is not None and not isinstance(version, str):
+        raise SyncError(f'{LOCK}: version must be a tag like "v0.1.0" (got {version!r})')
     try:
         lock = Lock(
             str(data.get("repo", DEFAULT_REPO)),
             str(data["commit"]),
             str(data["package"]),
             tuple(dict.fromkeys(exclude)),  # drop repeats, keep the order written
+            version,
         )
     except KeyError as exc:
         raise SyncError(f"{LOCK} is missing {exc.args[0]!r}") from None
@@ -263,6 +285,33 @@ def lock_is_on_main(repo: str, commit: str) -> str | None:
     return f"couldn't check whether the locked commit is on main (unexpected compare status {status!r})"
 
 
+def _at(commit: str, version: str | None) -> str:
+    return f"{commit[:7]} ({version})" if version else commit[:7]
+
+
+def version_tag(repo: str, commit: str) -> str | None:
+    """The release tag on `commit` (the highest, if several), or None when it has none.
+
+    One call to GitHub's tags endpoint, first page of 100: plenty for this repo's release cadence.
+    Raises SyncError when GitHub can't be asked; the caller decides what that means.
+    """
+    url = f"https://api.github.com/repos/{repo}/tags?per_page=100"
+    try:
+        data = json.loads(_get(url, "application/vnd.github+json"))
+    except ValueError:
+        raise SyncError("GitHub's tag list isn't JSON") from None
+    tags = data if isinstance(data, list) else []
+    names = [
+        tag.get("name")
+        for tag in tags
+        if isinstance(tag, dict) and isinstance(tag.get("commit"), dict) and tag["commit"].get("sha") == commit
+    ]
+    versions = [m for name in names if isinstance(name, str) and (m := _VERSION.fullmatch(name))]
+    # Highest first by number; a release sorts after its own pre-releases (v1.0.0 > v1.0.0-rc1).
+    best = max(versions, key=lambda m: (int(m[1]), int(m[2]), int(m[3]), m[4] is None, m[4] or ""), default=None)
+    return best[0] if best else None
+
+
 def _warn_if_lock_is_off_main(lock: Lock) -> None:
     reason = lock_is_on_main(lock.repo, lock.commit)
     if reason:
@@ -274,10 +323,12 @@ class GitHub:
     repo: str
     commit: str
     why: str  # "locked" or "main"
+    version: str | None = None  # the lock's version, for the label
 
     @property
     def label(self) -> str:
-        return f"{self.repo.split('/')[-1]} at {self.commit[:7]} ({self.why})"
+        version = f" {self.version}" if self.version else ""
+        return f"{self.repo.split('/')[-1]} at {self.commit[:7]}{version} ({self.why})"
 
     def read(self, path: str) -> bytes:
         return _get(f"https://raw.githubusercontent.com/{self.repo}/{self.commit}/{path}")
@@ -648,7 +699,7 @@ def run(args: argparse.Namespace) -> int:
                 print(f"(shared.lock is at {lock.commit[:7]}, main at {main[:7]}, with no shared file changed)")
             _report_orphans(root, package, files, exclude)
             return status
-        source = GitHub(lock.repo, lock.commit, "locked")
+        source = GitHub(lock.repo, lock.commit, "locked", lock.version)
         files = wanted_files(source, package, writing=False, root=root, exclude=exclude)
         status = report(root, files, source.label + _excluding(exclude), "python scripts/sync_shared.py")
         _report_orphans(root, package, files, exclude)
@@ -660,16 +711,24 @@ def run(args: argparse.Namespace) -> int:
         source = GitHub(lock.repo, main, "main")
         files = wanted_files(source, package, writing=not dry_run, root=root, exclude=exclude)
         changed = write_files(root, files, dry_run=dry_run, force=force)
-        new_lock = Lock(lock.repo, main, lock.package, lock.exclude)  # exclude carries over unchanged
+        try:
+            version = version_tag(lock.repo, main)
+        except SyncError as exc:
+            # The version is a label; the SHA is the pin. Keep the label it had if the commit didn't
+            # move, else write none rather than guess.
+            version = lock.version if main == lock.commit else None
+            kept = f"keeping {version}" if version else "writing none"
+            print(f"sync_shared.py: warning: couldn't look up a version tag ({exc}); {kept}", file=sys.stderr)
+        new_lock = Lock(lock.repo, main, lock.package, lock.exclude, version)  # exclude carries over unchanged
         if new_lock != lock and not dry_run:
             write_atomic(root / LOCK, new_lock.dump().encode("utf-8"))  # last: only once every file is in
-        moved = f"{lock.commit[:7]} -> {main[:7]}" if main != lock.commit else f"already at {main[:7]}"
+        moved = f"{lock.at} -> {new_lock.at}" if main != lock.commit else f"already at {new_lock.at}"
         prefix = "dry run, shared.lock" if dry_run else "shared.lock"
         print(f"{prefix}: {moved}{_excluding(exclude)}; " + (", ".join(changed) if changed else "no files changed"))
         _report_orphans(root, package, files, exclude)
         return 1 if (dry_run and (changed or new_lock != lock)) else 0
 
-    source = GitHub(lock.repo, lock.commit, "locked")
+    source = GitHub(lock.repo, lock.commit, "locked", lock.version)
     files = wanted_files(source, package, writing=not dry_run, root=root, exclude=exclude)
     changed = write_files(root, files, dry_run=dry_run, force=force)
     label = source.label + _excluding(exclude)
