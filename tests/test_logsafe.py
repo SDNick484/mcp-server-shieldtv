@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 
 import pytest
 
@@ -199,6 +200,61 @@ def test_mask_email():
     assert mask_email("") == ""
 
 
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ("denied: user@example.com", "denied: u***@example.com"),
+        ("from=first.last+tag@mail.example.org,", "from=f***@mail.example.org,"),
+        ("<User_1@Example.COM>", "<U***@Example.COM>"),
+        ("send to user@example.com.", "send to u***@example.com."),
+        ("user@example.com: not allowed", "u***@example.com: not allowed"),
+        ("mailto:user@example.com", "mailto:u***@example.com"),
+        ('{"email": "user@example.com"}', '{"email": "u***@example.com"}'),
+        ("MCP_ALLOWED_EMAILS=a@example.com,bob@example.com", "MCP_ALLOWED_EMAILS=a***@example.com,b***@example.com"),
+        ("https://example.com/users/user@example.com/", "https://example.com/users/u***@example.com/"),
+    ],
+)
+def test_email_addresses_are_masked(line, expected):
+    assert redact(line) == expected
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        # URL userinfo: a password is a secret (_URL_PASSWORD); a bare user name isn't an address.
+        ("mqtt://user:hunter2@broker.example.com:1883", "mqtt://user:***@broker.example.com:1883"),
+        ("ssh://git@git.example.com/repo.git", "ssh://git@git.example.com/repo.git"),
+        ("https://user@example.com/path", "https://user@example.com/path"),
+        # scp-style git remotes.
+        ("git@github.com:owner/repo.git", "git@github.com:owner/repo.git"),
+        # Decorators in a traceback, and a JWT that happens to sit next to an @.
+        ('    @app.route("/x")', '    @app.route("/x")'),
+        ("@functools.wraps(fn)", "@functools.wraps(fn)"),
+        ("eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl@example.com", "[jwt redacted]@example.com"),
+        ("dGVzdA==@example.com", "dGVzdA==@example.com"),
+        # Not a domain: no letters-only TLD.
+        ("admin@192.0.2.5:22", "admin@x.x.x.5:22"),
+        ("user@localhost", "user@localhost"),
+    ],
+)
+def test_email_rule_leaves_look_alikes_alone(line, expected):
+    assert redact(line) == expected
+
+
+@pytest.mark.parametrize("blob", ["a" * 100_000, "a" * 100_000 + "@", "0" * 100_000 + "://", "a." * 50_000 + "@"])
+def test_a_long_token_is_redacted_in_linear_time(blob):
+    # Logging runs on the event loop: a rule that backtracks over a long hex/base64 blob stalls the
+    # server. 100 KB took 20 s with the old unanchored URL-password rule; linear rules take ms.
+    start = time.perf_counter()
+    redact(f"payload {blob} end")
+    assert time.perf_counter() - start < 2.0
+
+
+def test_email_addresses_show_when_address_redaction_is_off():
+    # An address identifies a person; it isn't a credential, so --no-redact shows it like an IP.
+    assert redact_secrets("denied: user@example.com") == "denied: user@example.com"
+
+
 # --- property-based: the rules must be idempotent and leave no address behind ------------------
 # hypothesis is optional for the siblings (it isn't in their dev dependencies): without it only
 # these tests are skipped, never the module (a module-level importorskip would skip everything).
@@ -214,7 +270,7 @@ if hypothesis is not None:
 
     @needs_hypothesis
     @_settings
-    @hypothesis.given(st.text(alphabet=st.sampled_from("0123456789abcdefABCDEF:.-x /?&=@eyJ,;"), max_size=40))
+    @hypothesis.given(st.text(alphabet=st.sampled_from("0123456789abcdefABCDEF:.-x /?&=@eyJ,;+_*"), max_size=40))
     def test_redact_is_idempotent(text):
         """Redacting a redacted line changes nothing: a line can safely pass through two handlers."""
         once = redact(text)
@@ -233,7 +289,28 @@ if hypothesis is not None:
     @hypothesis.given(st.ip_addresses(v=6), st.text(alphabet="abcxyz ,.;", max_size=8))
     def test_no_ipv6_survives_redact(ip, around):
         hypothesis.assume(not (ip.is_loopback or ip.is_unspecified))
+        # A dotted tail of 0.x or 127.x ("::ffff:127.0.0.1") is kept on purpose, as the bare 0.x and
+        # 127.x addresses are (test_no_ipv4_survives_redact makes the same assumption).
+        hypothesis.assume(not str(ip).rsplit(":", 1)[1].startswith(("127.", "0.")))
         assert str(ip) not in redact(f"{around} {ip} {around}")
+
+    @needs_hypothesis
+    @_settings
+    @hypothesis.given(st.emails(), st.sampled_from([" ", ", ", "<", "(", "=", ": ", '"']))
+    def test_no_email_local_part_survives_redact(email, sep):
+        local, _, domain = email.rpartition("@")
+        hypothesis.assume(len(local) > 1 and "." in domain and domain.rsplit(".", 1)[1].isalpha())
+        hypothesis.assume(all(c.isalnum() or c in "._%+-" for c in local))
+        once = redact(f"to{sep}{email} ok")
+        assert f"{local}@" not in once
+        assert redact(once) == once
+
+    @needs_hypothesis
+    @_settings
+    @hypothesis.given(st.text(alphabet=st.sampled_from("ab.@:/+-_=*xyz.com"), max_size=40))
+    def test_email_rule_is_idempotent(text):
+        once = redact(text)
+        assert redact(once) == once
 
 
 def test_identifier_patterns(custom_patterns):
