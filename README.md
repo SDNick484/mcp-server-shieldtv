@@ -13,7 +13,7 @@ read its power state and foreground app.
 > prompts, HTTP, the Alpine service) are **verified against the simulator only**, a
 > wire-level fake that the real protocol library pairs and connects with.
 > [Verification status](#verification-status) lists every protocol assumption and whether a
-> Shield has confirmed it; [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md) is the checklist.
+> Shield has confirmed it; [HARDWARE_VALIDATION.md](https://github.com/SDNick484/mcp-server-shieldtv/blob/main/HARDWARE_VALIDATION.md) is the checklist.
 
 It's one of four sibling servers with the same conventions (dry run, `doctor`, typed results,
 Streamable HTTP behind Cloudflare Access):
@@ -39,10 +39,16 @@ only fixed commands; the server never exposes a raw shell (see
 ## Install
 
 ```sh
-git clone https://github.com/SDNick484/mcp-server-shieldtv.git
-cd mcp-server-shieldtv
+python -m venv ~/.venvs/shieldtv && . ~/.venvs/shieldtv/bin/activate
+pip install mcp-server-shieldtv
+```
+
+From source instead (for the newest code, or to run the tests):
+
+```sh
+git clone https://github.com/SDNick484/mcp-server-shieldtv.git && cd mcp-server-shieldtv
 python -m venv .venv && . .venv/bin/activate
-pip install -e .
+pip install -e ".[dev]" && pytest
 ```
 
 Requires Python 3.11+.
@@ -90,7 +96,7 @@ Shield 192.168.1.50
 ```
 
 `doctor` checks each layer in order and stops at the first failure, saying what it means and
-which [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md) step covers it. It never presses a
+which [HARDWARE_VALIDATION.md](https://github.com/SDNick484/mcp-server-shieldtv/blob/main/HARDWARE_VALIDATION.md) step covers it. It never presses a
 key, launches anything or pairs. Output is redacted (addresses, MACs) unless `--no-redact`.
 
 **Treat `cert.pem` and `key.pem` like a password.** Anyone who has them can control your
@@ -488,7 +494,7 @@ mypy                # strict type checking of src/
 
 CI runs it all on Python 3.11-3.14, plus the Alpine smoke test.
 `npx @modelcontextprotocol/inspector mcp-server-shieldtv` browses tools, resources and prompts
-by hand. [docs/ADB_TOOLS.md](docs/ADB_TOOLS.md) reviews the ADB tools and proposes read-only
+by hand. [docs/ADB_TOOLS.md](https://github.com/SDNick484/mcp-server-shieldtv/blob/main/docs/ADB_TOOLS.md) reviews the ADB tools and proposes read-only
 additions (design only).
 
 ## Verification status
@@ -520,11 +526,11 @@ it and nothing has confirmed it.
 
 ## Roadmap
 
-- Hardware validation of this branch ([HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md))
-- The ADB proposals in [docs/ADB_TOOLS.md](docs/ADB_TOOLS.md), once their outputs are captured
+- Hardware validation of this branch ([HARDWARE_VALIDATION.md](https://github.com/SDNick484/mcp-server-shieldtv/blob/main/HARDWARE_VALIDATION.md))
+- The ADB proposals in [docs/ADB_TOOLS.md](https://github.com/SDNick484/mcp-server-shieldtv/blob/main/docs/ADB_TOOLS.md), once their outputs are captured
 - Several Shields from one server, by name (as the sibling servers do)
 - Publish to PyPI and the MCP registry
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](https://github.com/SDNick484/mcp-server-shieldtv/blob/main/LICENSE).
