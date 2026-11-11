@@ -103,6 +103,13 @@ Hardware facts the code depends on (the library hides them):
 - Volume behind HDMI-CEC arrives with `max == 0`; it is reported as `None`. In standby the
   Shield reports its own volume (e.g. 1/15) instead.
 
+## Releases
+
+Version lives only in `src/shieldtv_mcp/__init__.py` (`pyproject.toml` reads it). Bump it and add a
+CHANGELOG.md section for every release: pip treats a same-version install as already satisfied. Pushing
+tag `vX.Y.Z` runs `.github/workflows/release.yml` (PyPI trusted publishing, then a GitHub release).
+CONTRIBUTING.md has the steps and the one-time PyPI setup.
+
 ## Commands
 
 ```sh
