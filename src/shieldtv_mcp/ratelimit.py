@@ -1,4 +1,4 @@
-"""Token-bucket rate limiting, for guarding devices against runaway tool loops.
+"""Rate limiting (token buckets and windows), for guarding devices against runaway tool loops.
 
 Shared by the sibling servers, byte for byte. Change it in mcp-server-shared,
 not in a copy, then sync (`python scripts/sync_shared.py --update`).
@@ -14,6 +14,12 @@ presses, how many activity changes) in its own module, because those are about
 its device, and builds one bucket per device and per kind of action
 (``KeyedTokenBucket`` when the devices are only known at run time).
 
+A bucket refills as it goes, so over a long stretch it allows more than its
+capacity. When the number itself is the safety limit ("never more than 20
+volume-up presses in any five minutes", because each press makes a receiver
+louder and a hub can't read the level back), use ``WindowLimit`` instead: it
+counts what happened in the last ``window`` seconds and never allows more.
+
 Refuse or wait? ``take`` refuses at once, which is right for a tool call: the
 model hears why and decides. ``acquire`` waits (up to a timeout), which suits
 code that paces itself, such as a macro stepping through presses.
@@ -23,6 +29,7 @@ from __future__ import annotations
 
 import math
 import time
+from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -205,13 +212,58 @@ class KeyedTokenBucket:
             yield waited
 
 
+@dataclass
+class WindowLimit:
+    """At most ``limit`` actions in any ``window`` seconds: a sliding window, not a bucket.
+
+    ``take`` and ``refund`` behave like ``TokenBucket``'s: all-or-nothing, and a
+    refused take returns the seconds until enough earlier actions have left the
+    window (infinity for more than ``limit`` at once), so ``refusal`` words it.
+    It keeps one timestamp per action, so ``limit`` should be small.
+    """
+
+    limit: int
+    window: float  # seconds
+    clock: Callable[[], float] = time.monotonic
+    _stamps: deque[float] = field(init=False, default_factory=deque)
+
+    def __post_init__(self) -> None:
+        if self.limit < 1 or not math.isfinite(self.window) or self.window <= 0:
+            raise ValueError("limit and window must be positive")
+
+    def _expire(self, now: float) -> None:
+        while self._stamps and self._stamps[0] <= now - self.window:
+            self._stamps.popleft()
+
+    def take(self, n: int = 1) -> float:
+        """Count n actions now and return 0.0, or count nothing and return the seconds until n would fit."""
+        if math.isnan(n) or n < 0:
+            raise ValueError("cannot take a negative number of actions")
+        if n > self.limit:
+            return float("inf")
+        now = self.clock()
+        self._expire(now)
+        over = len(self._stamps) + n - self.limit
+        if over <= 0:
+            self._stamps.extend([now] * n)
+            return 0.0
+        return self._stamps[over - 1] + self.window - now
+
+    def refund(self, n: int = 1) -> None:
+        """Uncount the n most recent actions, for ones that failed before reaching the device."""
+        if math.isnan(n) or n < 0:
+            raise ValueError("can't refund a negative number of actions")
+        for _ in range(min(n, len(self._stamps))):
+            self._stamps.pop()
+
+
 def refusal(what: str, wait: float, device: str | None = None) -> str:
     """The error message for a refused action.
 
     For example: "Rate limit on tv-1: refusing to launch Contra (try again in
     12s). This guards against runaway loops; ...".
 
-    ``wait`` is what ``TokenBucket.take`` returned. The message says why the
+    ``wait`` is what ``TokenBucket.take`` or ``WindowLimit.take`` returned. The message says why the
     limit exists, so the model doesn't treat it as a fault to work around.
     """
     on = f" on {device}" if device else ""
