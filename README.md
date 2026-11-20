@@ -217,6 +217,7 @@ Shield; note that `pair` also saves its host as the default in `config.json`).
 | `SHIELDTV_CONFIG_DIR` | `$XDG_CONFIG_HOME/mcp-server-shieldtv` | Where the certificate, key and `config.json` live |
 | `XDG_CONFIG_HOME` | `~/.config` | Standard base directory, used when `SHIELDTV_CONFIG_DIR` is unset |
 | `SHIELDTV_DRY_RUN` | off | Read the Shield, send nothing that changes anything (`serve --dry-run`) |
+| `SHIELDTV_VOLUME_UP_LIMIT` | 20 | `VOLUME_UP` presses allowed in any 5 minutes, 1-20; beats `"volume_up_limit"` in `config.json` |
 | `SHIELDTV_DEBUG` | off | Log the protocol traffic to stderr (`--debug`) |
 | `SHIELDTV_LOG_UNREDACTED` | off | Show LAN addresses and MACs in logs (`--no-redact`); keys and tokens stay hidden |
 
@@ -264,6 +265,13 @@ sent) or `dry_run`. Failures are MCP errors with a sentence that says what to do
 
 **Dry run** (`serve --dry-run`, `call --dry-run` or `SHIELDTV_DRY_RUN=1`) reads the Shield and
 validates every call as usual, but sends nothing; results say what would have been sent.
+
+**Volume up is capped: at most 20 `VOLUME_UP` presses in any 5 minutes**, counted across calls. The
+key reaches the TV or receiver over HDMI-CEC, which can't report the level back, so every press is one
+step louder; the receiver's and TV's own servers cap a level they are set to (`max_volume`), but not
+presses. Over the limit, `send_key` refuses the whole call and points to those servers' volume tools.
+Volume down and mute are never limited. `"volume_up_limit"` in `config.json` or
+`SHIELDTV_VOLUME_UP_LIMIT` lowers the cap (1-20).
 
 ### Resources and prompts
 

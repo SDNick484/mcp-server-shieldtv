@@ -133,6 +133,21 @@ def test_name_and_mac_saved_by_pair(config_dir):
     assert (s.name, s.mac) == ("SHIELD", "00:04:4B:A1:B2:C3")
 
 
+def test_volume_up_limit(config_dir, monkeypatch):
+    assert load_settings().volume_up_limit == 20
+    (config_dir / "config.json").write_text(json.dumps({"volume_up_limit": 8}))
+    assert load_settings().volume_up_limit == 8
+    monkeypatch.setenv("SHIELDTV_VOLUME_UP_LIMIT", "5")
+    assert load_settings().volume_up_limit == 5  # the environment wins
+    monkeypatch.setenv("SHIELDTV_VOLUME_UP_LIMIT", "50")
+    s = load_settings()
+    assert s.volume_up_limit == 8 and any("SHIELDTV_VOLUME_UP_LIMIT='50'" in p for p in s.problems)
+    monkeypatch.delenv("SHIELDTV_VOLUME_UP_LIMIT")
+    (config_dir / "config.json").write_text(json.dumps({"volume_up_limit": True}))
+    s = load_settings()
+    assert s.volume_up_limit == 20 and any("volume_up_limit=True" in p for p in s.problems)
+
+
 def test_dry_run_from_the_environment(config_dir, monkeypatch):
     assert load_settings().dry_run is False
     monkeypatch.setenv("SHIELDTV_DRY_RUN", "1")

@@ -169,6 +169,52 @@ async def test_send_key_repeat(mcp_client, fake):
     assert fake.keys == ["DPAD_DOWN"] * 3
 
 
+# --- the volume-up cap -------------------------------------------------------------------------
+# VOLUME_UP reaches the TV or receiver over HDMI-CEC, which can't report the level back, so every press is a
+# step louder. WindowLimit itself is tested in test_ratelimit.py (shared); these test how send_key uses it.
+def capped(limit: int = 20) -> list[float]:
+    from shieldtv_mcp.ratelimit import WindowLimit
+
+    now = [0.0]
+    server.client().volume_up_window = WindowLimit(limit, 300, clock=lambda: now[0])
+    return now
+
+
+async def test_volume_up_is_capped_per_window(mcp_client, fake):
+    now = capped()
+    for _ in range(2):
+        assert not (await mcp_client.call_tool("shield_send_key", {"key": "VOLUME_UP", "repeat": 10})).is_error
+    now[0] = 299.0
+    result = await mcp_client.call_tool("shield_send_key", {"key": "VOLUME_UP"})
+    assert result.is_error
+    for expected in [
+        "at most 20 volume-up presses in any 5 minutes",
+        "try again in 1s",
+        "onkyo_set_volume",
+        "webos_set_volume",
+        "max_volume",
+    ]:
+        assert expected in text(result), expected
+    assert fake.keys == ["VOLUME_UP"] * 20  # the refused press was not sent
+    now[0] = 300.0
+    assert not (await mcp_client.call_tool("shield_send_key", {"key": "VOLUME_UP", "repeat": 10})).is_error
+
+
+async def test_volume_up_refuses_whole_calls(mcp_client, fake):
+    capped(limit=5)
+    await mcp_client.call_tool("shield_send_key", {"key": "VOLUME_UP", "repeat": 4})
+    result = await mcp_client.call_tool("shield_send_key", {"key": "VOLUME_UP", "repeat": 2})
+    assert result.is_error and "refusing to press VOLUME_UP x2" in text(result)
+    assert fake.keys == ["VOLUME_UP"] * 4
+
+
+async def test_volume_down_and_mute_are_never_capped(mcp_client, fake):
+    capped(limit=1)
+    for key, repeat in (("VOLUME_UP", 1), ("VOLUME_DOWN", 5), ("VOLUME_MUTE", 1)):
+        assert not (await mcp_client.call_tool("shield_send_key", {"key": key, "repeat": repeat})).is_error
+    assert len(fake.keys) == 7
+
+
 @pytest.mark.parametrize(
     "args", [{"key": "POWER"}, {"key": "text:hi"}, {"key": "HOME", "repeat": 11}, {"key": "HOME", "repeat": 0}]
 )

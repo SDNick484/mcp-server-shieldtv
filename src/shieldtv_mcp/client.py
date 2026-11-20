@@ -48,7 +48,17 @@ from androidtvremote2 import (
 from mcp.server.mcpserver.exceptions import ToolError
 from typing_extensions import TypedDict
 
-from .config import ALLOWED_KEYS, CLIENT_NAME, App, Settings, config_dir, load_settings, save_config
+from .config import (
+    ALLOWED_KEYS,
+    CLIENT_NAME,
+    VOLUME_UP_WINDOW,
+    App,
+    Settings,
+    config_dir,
+    load_settings,
+    save_config,
+)
+from .ratelimit import WindowLimit
 
 log = logging.getLogger(__name__)
 
@@ -180,6 +190,8 @@ class ShieldClient:
         self, settings: Settings, remote_factory: RemoteFactory = AndroidTVRemote, finder: Finder = _mdns
     ) -> None:
         self.settings = settings
+        # VOLUME_UP presses in the last VOLUME_UP_WINDOW seconds (config.py says why); shield_send_key charges it.
+        self.volume_up_window = WindowLimit(settings.volume_up_limit, VOLUME_UP_WINDOW)
         self._remote_factory = remote_factory
         self._finder = finder
         self._remote: AndroidTVRemote | None = None

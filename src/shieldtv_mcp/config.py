@@ -53,6 +53,14 @@ KeyName = Literal[
 ]
 ALLOWED_KEYS: frozenset[str] = frozenset(get_args(KeyName))
 
+# VOLUME_UP presses: at most VOLUME_UP_LIMIT in any VOLUME_UP_WINDOW seconds, counted across calls. The key
+# reaches the TV or receiver over HDMI-CEC, which doesn't report the level back, so each press is one step
+# louder whatever the level already is; the receiver's and TV's own servers cap a level they are *set* to
+# (max_volume), but not presses. A sliding window (ratelimit.WindowLimit), not a bucket, because the count
+# itself is the safety limit. "volume_up_limit" in config.json or SHIELDTV_VOLUME_UP_LIMIT lowers it (1-20).
+VOLUME_UP_LIMIT = 20
+VOLUME_UP_WINDOW = 300.0
+
 
 @dataclass(frozen=True)
 class App:
@@ -131,6 +139,8 @@ class Settings:
     port: int = REMOTE_PORT
     pairing_port: int = PAIRING_PORT
     dry_run: bool = False
+    # VOLUME_UP presses allowed in any VOLUME_UP_WINDOW; settings can only lower it.
+    volume_up_limit: int = VOLUME_UP_LIMIT
     # Anything wrong with config.json, in words (logged at startup, shown by doctor).
     problems: tuple[str, ...] = ()
 
@@ -185,6 +195,21 @@ def _port(value: Any, what: str, default: int, problems: list[str]) -> int:
     return default
 
 
+def _volume_up_limit(env: str | None, value: Any, problems: list[str]) -> int:
+    """SHIELDTV_VOLUME_UP_LIMIT wins over config.json's "volume_up_limit"; either may only lower the default."""
+    expected = f"must be a whole number from 1 to {VOLUME_UP_LIMIT}"
+    if env is not None and env.strip():
+        if env.strip().isdigit() and 1 <= int(env) <= VOLUME_UP_LIMIT:
+            return int(env)
+        problems.append(f"ignoring SHIELDTV_VOLUME_UP_LIMIT={env!r}: {expected}")
+    if value is None:
+        return VOLUME_UP_LIMIT
+    if isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= VOLUME_UP_LIMIT:
+        return value
+    problems.append(f"ignoring volume_up_limit={value!r}: {expected}")
+    return VOLUME_UP_LIMIT
+
+
 def _flag(value: str | None) -> bool:
     return (value or "").strip().lower() in ("1", "true", "yes", "on")
 
@@ -224,6 +249,9 @@ def load_settings(host_override: str | None = None) -> Settings:
         port=port,
         pairing_port=pairing_port,
         dry_run=_flag(os.environ.get("SHIELDTV_DRY_RUN")),
+        volume_up_limit=_volume_up_limit(
+            os.environ.get("SHIELDTV_VOLUME_UP_LIMIT"), data.get("volume_up_limit"), problems
+        ),
         problems=tuple(problems),
     )
 

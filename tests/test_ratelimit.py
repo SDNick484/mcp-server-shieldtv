@@ -1,4 +1,4 @@
-"""TokenBucket, KeyedTokenBucket and refusal: the shared rate-limit mechanism.
+"""TokenBucket, KeyedTokenBucket, WindowLimit and refusal: the shared rate-limit mechanism.
 
 Shared by the sibling servers along with ratelimit.py; only the package name in
 the import below differs between repos. Change it in mcp-server-shared, not in
@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pytest
 
-from shieldtv_mcp.ratelimit import KeyedTokenBucket, TokenBucket, refusal
+from shieldtv_mcp.ratelimit import KeyedTokenBucket, TokenBucket, WindowLimit, refusal
 
 
 def bucket(capacity: float, rate: float) -> tuple[TokenBucket, list[float]]:
@@ -380,3 +380,91 @@ async def test_keyed_reserve():
 def test_keyed_nonsense_settings_are_rejected_up_front(capacity, rate):
     with pytest.raises(ValueError):
         KeyedTokenBucket(capacity, rate)
+
+
+# --- WindowLimit ---------------------------------------------------------------------------
+
+
+def window(limit: int, seconds: float) -> tuple[WindowLimit, list[float]]:
+    now = [0.0]
+    return WindowLimit(limit, seconds, clock=lambda: now[0]), now
+
+
+def test_window_allows_the_limit_then_refuses_until_the_oldest_ages_out():
+    w, now = window(3, 300)
+    assert [w.take() for _ in range(3)] == [0.0, 0.0, 0.0]
+    now[0] = 100.0
+    assert w.take() == pytest.approx(200.0)  # the first action leaves the window at t=300
+    now[0] = 300.0
+    assert w.take() == 0.0
+
+
+def test_window_never_allows_more_than_the_limit_in_any_window():
+    # Unlike a token bucket of the same size, nothing trickles back halfway through.
+    w, now = window(20, 300)
+    assert w.take(20) == 0.0
+    for t in (15.0, 150.0, 299.9):
+        now[0] = t
+        assert w.take() > 0
+    now[0] = 300.0
+    assert w.take(20) == 0.0
+
+
+def test_window_wait_is_until_enough_have_aged_out():
+    w, now = window(4, 60)
+    w.take(2)
+    now[0] = 10.0
+    w.take(2)
+    now[0] = 20.0
+    assert w.take(3) == pytest.approx(50.0)  # three free slots need the t=10 pair gone: t=70
+
+
+def test_window_a_refused_take_takes_nothing():
+    w, now = window(2, 60)
+    w.take()
+    assert w.take(2) > 0
+    assert w.take() == 0.0  # the refused pair took nothing, so one slot was still free
+
+
+def test_window_more_than_the_limit_is_never_possible():
+    w, _ = window(3, 60)
+    assert w.take(4) == float("inf")
+    assert w.take(3) == 0.0  # and it took nothing
+
+
+def test_window_refund_gives_back_the_newest():
+    w, now = window(2, 60)
+    w.take()
+    now[0] = 30.0
+    w.take()
+    w.refund()
+    assert w.take() == 0.0
+    assert w.take() == pytest.approx(30.0)  # the t=0 action is still counted until t=60
+
+
+def test_window_refund_of_more_than_was_taken_empties_it():
+    w, _ = window(2, 60)
+    w.take()
+    w.refund(5)
+    assert w.take(2) == 0.0
+
+
+@pytest.mark.parametrize("limit, seconds", [(0, 60), (-1, 60), (3, 0), (3, -1), (3, float("inf")), (3, float("nan"))])
+def test_window_nonsense_settings_are_rejected(limit, seconds):
+    with pytest.raises(ValueError):
+        WindowLimit(limit, seconds)
+
+
+@pytest.mark.parametrize("n", [-1, float("nan")])
+def test_window_negative_amounts_are_rejected(n):
+    w, _ = window(3, 60)
+    with pytest.raises(ValueError):
+        w.take(n)
+    with pytest.raises(ValueError):
+        w.refund(n)
+
+
+def test_window_wait_works_with_refusal():
+    w, _ = window(1, 300)
+    w.take()
+    assert "try again in 300s" in refusal("press VolumeUp", w.take(), device="hub-1")

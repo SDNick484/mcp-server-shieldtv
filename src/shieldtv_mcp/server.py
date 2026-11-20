@@ -222,9 +222,22 @@ def shield_send_key(key: KeyName, repeat: Repeat = 1) -> ActionResult:
 
     <important_notes>
     - Only sends allowed key enum values; power toggles and raw text typing are not supported.
+    - VOLUME_UP is capped at 20 presses in any 5 minutes; to set a level, use the receiver's or TV's volume tool.
     </important_notes>
     """
     c = client()
+    if key == "VOLUME_UP":
+        wait = c.volume_up_window.take(repeat)
+        if wait:
+            window = c.volume_up_window
+            when = "more than that at once" if wait == float("inf") else f"try again in {max(wait, 1):.0f}s"
+            raise ShieldError(
+                f"Volume-up limit: refusing to press VOLUME_UP x{repeat}: at most {window.limit} volume-up presses "
+                f"in any {window.window / 60:.0f} minutes ({when}). The Shield can't read the TV's or receiver's "
+                "volume, so this caps how much louder it can make things. To set a level directly, use the "
+                "receiver's or TV's own volume tool (onkyo_set_volume, webos_set_volume), which is capped at its "
+                "max_volume."
+            )
     sent = [f"KEYCODE_{key}"] * repeat
     if c.settings.dry_run:
         return _result(c, f"press {key} x{repeat}", sent, "dry_run")
