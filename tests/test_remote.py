@@ -14,6 +14,7 @@ import contextlib
 import socket
 import time
 from contextlib import asynccontextmanager
+from typing import Any
 
 import anyio
 import httpx2
@@ -23,6 +24,8 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from mcp import Client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.server.mcpserver import MCPServer
+from mcp.shared.exceptions import MCPError
+from mcp.types import ElicitResult, InputRequiredResult
 
 from shieldtv_mcp import remote  # the only line that differs between repos
 
@@ -114,6 +117,35 @@ def test_loopback_recognizes_localhost_ipv6_and_rejects_non_loopback():
         remote.HttpConfig(bind="device.lan").check()
 
 
+# --- caller kinds and the automation settings ------------------------------------------
+def test_automation_tiers_default_and_parse():
+    assert parse(["--http"]).automation_tiers == frozenset({"read", "power-off"})
+    assert remote.HttpConfig().automation_tiers == frozenset({"read", "power-off"})
+    cfg = parse([], {"MCP_AUTOMATION_TIERS": "read, Everyday"})
+    assert cfg.automation_tiers == frozenset({"read", "everyday"})
+    cfg.check()
+    # Set but empty narrows (automated callers get nothing); it never falls back to the wider default.
+    assert parse([], {"MCP_AUTOMATION_TIERS": ""}).automation_tiers == frozenset()
+
+
+@pytest.mark.parametrize("value,named", [("costly", "costly"), ("read,costly", "costly"), ("reed", "reed")])
+def test_automation_tiers_refuse_costly_and_unknown(value, named):
+    cfg = parse([], {"MCP_AUTOMATION_TIERS": value})
+    with pytest.raises(remote.ConfigError, match="MCP_AUTOMATION_TIERS") as refused:
+        cfg.check()
+    assert named in str(refused.value)
+    with pytest.raises(remote.ConfigError, match="MCP_AUTOMATION_TIERS"):
+        remote.build_app(tiny_server([]), cfg)  # startup refuses, not just check()
+
+
+def test_service_tokens_setting_parsed():
+    env = {"CF_ACCESS_TEAM_DOMAIN": TEAM, "CF_ACCESS_AUD": AUD}
+    assert parse([], env).access.service_tokens == frozenset()  # unset: none admitted
+    cfg = parse([], {**env, "MCP_ALLOWED_SERVICE_TOKENS": "token-1.access, Token-2.access"})
+    assert cfg.access.service_tokens == frozenset({"token-1.access", "Token-2.access"})  # IDs are exact
+    assert "token-1.access" not in repr(cfg)  # like the e-mail allow-list, not for logs
+
+
 def test_certs_url_and_default_verifier_wiring():
     assert POLICY.certs_url == f"https://{TEAM}/cdn-cgi/access/certs"
     app = remote.build_app(tiny_server([]), CFG)
@@ -172,6 +204,82 @@ async def test_email_allow_list():
         await remote.AccessVerifier(policy, public_key).verify(token(email=""))
 
 
+def automated_policy(*tokens: str, emails: frozenset[str] = frozenset()) -> remote.AccessPolicy:
+    return remote.AccessPolicy(TEAM, (AUD,), emails, frozenset(tokens))
+
+
+def service_token(**overrides: object) -> str:
+    return token(email=None, common_name="token-1.access", **overrides)
+
+
+READ_ONLY = frozenset({"read"})
+
+
+@pytest.mark.anyio
+async def test_caller_person_from_email():
+    verifier = remote.AccessVerifier(POLICY, public_key)
+    caller = verifier.caller(await verifier.verify(token(email="User@Example.com")), READ_ONLY)
+    assert caller == remote.Caller("person", "user@example.com", frozenset(remote.TIERS))
+    assert caller.tiers == {"read", "power-off", "everyday", "costly"}
+
+
+@pytest.mark.anyio
+async def test_caller_automated_from_admitted_common_name():
+    verifier = remote.AccessVerifier(automated_policy("token-1.access"), public_key)
+    caller = verifier.caller(await verifier.verify(service_token()), frozenset({"read", "power-off"}))
+    assert caller == remote.Caller("automated", "token-1.access", frozenset({"read", "power-off"}))
+    assert "costly" not in caller.tiers
+
+
+@pytest.mark.anyio
+async def test_service_token_refused_when_not_admitted():
+    """Review Focus 1: no allow-lists at all, a service token (common_name only) gets in no more."""
+    verifier = remote.AccessVerifier(POLICY, public_key)
+    claims = await verifier.verify(service_token())  # signature, audience and expiry are fine
+    with pytest.raises(remote.AccessDenied, match="unknown caller"):
+        verifier.caller(claims, READ_ONLY)
+    # Admitting some other token doesn't admit this one.
+    other = remote.AccessVerifier(automated_policy("token-2.access"), public_key)
+    with pytest.raises(remote.AccessDenied, match="unknown caller"):
+        other.caller(claims, READ_ONLY)
+
+
+@pytest.mark.anyio
+async def test_service_token_admitted_alongside_email_allow_list():
+    policy = automated_policy("token-1.access", emails=frozenset({"user@example.com"}))
+    verifier = remote.AccessVerifier(policy, public_key)
+    claims = await verifier.verify(service_token())  # no email, so the e-mail list doesn't apply
+    assert verifier.caller(claims, READ_ONLY).kind == "automated"
+    # ...but it still applies to anything that does carry one.
+    with pytest.raises(remote.AccessDenied, match="not in MCP_ALLOWED_EMAILS"):
+        await verifier.verify(token(email="guest@example.com", common_name="token-1.access"))
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("claims", [{}, {"email": ""}, {"common_name": ""}, {"common_name": 7}, {"email": 7}])
+async def test_jwt_with_neither_email_nor_common_name_refused(claims):
+    verifier = remote.AccessVerifier(automated_policy("", "7"), public_key)
+    with pytest.raises(remote.AccessDenied, match="unknown caller"):
+        verifier.caller(claims, READ_ONLY)
+
+
+@pytest.mark.anyio
+async def test_a_signed_jwt_with_no_identity_is_refused_as_an_unknown_caller():
+    verifier = remote.AccessVerifier(automated_policy("token-1.access"), public_key)
+    claims = await verifier.verify(token(email=None))
+    with pytest.raises(remote.AccessDenied, match="unknown caller"):
+        verifier.caller(claims, READ_ONLY)
+
+
+def test_caller_shown_masks_email():
+    assert remote.Caller("person", "user@example.com", frozenset()).shown == "u***@example.com"
+    assert remote.Caller("person", "nonsense", frozenset()).shown == "this identity"
+    assert remote.Caller("automated", "token-1.access", frozenset()).shown == "token-1.access"
+    assert remote.LOCAL.shown == "local"
+    assert remote.Caller("local", "local", frozenset(remote.TIERS)) == remote.LOCAL
+    assert remote.TIERS == ("read", "power-off", "everyday", "costly")
+
+
 def test_policy_repr_hides_the_allow_list():
     """A config repr ends up in logs and tracebacks; the e-mail allow-list must not."""
     policy = remote.AccessPolicy(TEAM, (AUD,), frozenset({"user@example.com"}))
@@ -202,14 +310,15 @@ async def running(
     cfg: remote.HttpConfig,
     starts: list[int],
     health_check: remote.HealthChecker | None = None,
+    server: MCPServer | None = None,
 ):
     import uvicorn
 
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
     port = sock.getsockname()[1]
-    verifier = remote.AccessVerifier(POLICY, public_key) if cfg.access else None
-    app = remote.build_app(tiny_server(starts), cfg, verifier, health_check=health_check)
+    verifier = remote.AccessVerifier(cfg.access, public_key) if cfg.access else None
+    app = remote.build_app(server or tiny_server(starts), cfg, verifier, health_check=health_check)
     server = uvicorn.Server(uvicorn.Config(app, log_level="warning", lifespan="on"))
     async with anyio.create_task_group() as tg:
         tg.start_soon(server.serve, [sock])
@@ -291,6 +400,312 @@ async def test_tools_work_with_a_valid_assertion_and_the_lifespan_runs_once():
             async with mcp_client(f"{base}/thing/mcp", {remote.ACCESS_HEADER: token()}) as c:
                 assert (await c.call_tool("ping", {})).content[0].text == "pong"
     assert starts == [1]
+
+
+async def scope_seen_by_inner_app(verifier: remote.AccessVerifier | None, headers: list[tuple[bytes, bytes]]):
+    seen: list[dict] = []
+
+    async def inner(scope, receive, send):
+        seen.append(scope)
+
+    sent: list[dict] = []
+
+    async def send(message):
+        sent.append(message)
+
+    async def receive():
+        return {"type": "http.request"}
+
+    app = remote.AccessMiddleware(inner, verifier, automation_tiers=frozenset({"read"}))
+    await app({"type": "http", "method": "POST", "path": "/mcp", "headers": headers}, receive, send)
+    return seen, sent
+
+
+@pytest.mark.anyio
+async def test_middleware_puts_caller_in_scope():
+    assert remote.CALLER_STATE_KEY == "mcp_caller"
+    verifier = remote.AccessVerifier(automated_policy("token-1.access"), public_key)
+    header = remote.ACCESS_HEADER.encode()
+
+    seen, _ = await scope_seen_by_inner_app(verifier, [(header, token().encode())])
+    assert seen[0]["state"][remote.CALLER_STATE_KEY].kind == "person"
+    assert seen[0]["state"][remote.CALLER_STATE_KEY].ident == "user@example.com"
+
+    seen, _ = await scope_seen_by_inner_app(verifier, [(header, service_token().encode())])
+    caller = seen[0]["state"][remote.CALLER_STATE_KEY]
+    assert (caller.kind, caller.ident, caller.tiers) == ("automated", "token-1.access", frozenset({"read"}))
+
+    seen, _ = await scope_seen_by_inner_app(None, [])
+    assert seen[0]["state"][remote.CALLER_STATE_KEY] is remote.LOCAL
+
+
+@pytest.mark.anyio
+async def test_middleware_keeps_existing_scope_state():
+    seen: list[dict] = []
+
+    async def inner(scope, receive, send):
+        seen.append(scope)
+
+    async def receive():
+        return {"type": "http.request"}
+
+    async def send(message):
+        pass
+
+    app = remote.AccessMiddleware(inner, None)
+    await app({"type": "http", "method": "POST", "path": "/mcp", "headers": [], "state": {"x": 1}}, receive, send)
+    assert seen[0]["state"] == {"x": 1, "mcp_caller": remote.LOCAL}
+
+
+@pytest.mark.anyio
+async def test_middleware_denies_an_unadmitted_service_token_with_403():
+    verifier = remote.AccessVerifier(POLICY, public_key)
+    seen, sent = await scope_seen_by_inner_app(verifier, [(remote.ACCESS_HEADER.encode(), service_token().encode())])
+    assert seen == [] and sent[0]["status"] == 403
+
+
+@pytest.mark.anyio
+async def test_unadmitted_service_token_gets_403_over_http():
+    """Review Focus 1, end to end: today this token gets in; with nothing configured it must not."""
+    async with running(CFG, []) as base, httpx2.AsyncClient() as http:
+        body = {"jsonrpc": "2.0", "id": 1, "method": "ping"}
+        resp = await http.post(f"{base}/thing/mcp", json=body, headers={remote.ACCESS_HEADER: service_token()})
+        assert resp.status_code == 403 and resp.json() == {"error": "forbidden"}
+
+
+@pytest.mark.anyio
+async def test_admitted_service_token_gets_in_over_http():
+    cfg = remote.HttpConfig(
+        path="/thing/mcp", public_hosts=("mcp.example.com",), access=automated_policy("token-1.access")
+    )
+    async with (
+        running(cfg, []) as base,
+        mcp_client(f"{base}/thing/mcp", {remote.ACCESS_HEADER: service_token()}) as c,
+    ):
+        assert (await c.call_tool("ping", {})).content[0].text == "pong"
+
+
+# --- per-tool authorization over HTTP -----------------------------------------------
+def tiered_server(ran: list[str]) -> MCPServer:
+    m = MCPServer("tiered", request_state_security=remote.request_state_security())
+
+    @m.tool()
+    @remote.tier("read")
+    def status() -> str:
+        ran.append("status")
+        return "ok"
+
+    @m.tool()
+    @remote.tier("power-off")
+    async def power_off() -> str:
+        ran.append("power_off")
+        return "off"
+
+    @m.tool()
+    @remote.tier("everyday")
+    async def play() -> str:
+        ran.append("play")
+        return "playing"
+
+    @m.tool()
+    @remote.tier("costly", confirm="Update the firmware?")
+    async def update() -> str:
+        ran.append("update")
+        return "updated"
+
+    @m.tool()
+    @remote.tier(lambda args: "power-off" if args["state"] == "off" else "everyday")
+    async def set_power(state: str, tv: str | None = None) -> str:
+        ran.append(f"set_power {state}")
+        return state
+
+    return m
+
+
+def automation_cfg(tiers: frozenset[str] = remote.DEFAULT_AUTOMATION_TIERS) -> remote.HttpConfig:
+    return remote.HttpConfig(
+        path="/thing/mcp",
+        public_hosts=("mcp.example.com",),
+        access=automated_policy("token-1.access"),
+        automation_tiers=tiers,
+    )
+
+
+# Both protocol revisions: the request (and so the caller) reaches the tool by different paths.
+@pytest.fixture(params=["legacy", "2026-07-28"])
+def protocol(request):
+    return request.param
+
+
+@asynccontextmanager
+async def tiered_client(cfg: remote.HttpConfig, ran: list[str], jwt_token: str, mode: str):
+    async with running(cfg, [], server=tiered_server(ran)) as base:
+        transport = streamable_http_client(
+            f"{base}/thing/mcp", http_client=httpx2.AsyncClient(headers={remote.ACCESS_HEADER: jwt_token})
+        )
+        async with Client(transport, mode=mode) as c:
+            yield c
+
+
+EVERYDAY = frozenset({"read", "power-off", "everyday"})
+
+
+@pytest.mark.anyio
+async def test_automated_caller_gets_read_and_power_off(protocol):
+    ran: list[str] = []
+    async with tiered_client(automation_cfg(), ran, service_token(), protocol) as c:
+        assert (await c.call_tool("status", {})).content[0].text == "ok"
+        assert (await c.call_tool("power_off", {})).content[0].text == "off"
+    assert ran == ["status", "power_off"]
+
+
+@pytest.mark.anyio
+async def test_automated_caller_refused_everyday_with_message(protocol):
+    ran: list[str] = []
+    async with tiered_client(automation_cfg(), ran, service_token(), protocol) as c:
+        result = await c.call_tool("play", {})
+    assert result.is_error
+    message = result.content[0].text
+    assert "This tool needs a person; automated callers may only use: read, power-off." in message
+    assert ran == []
+
+
+@pytest.mark.anyio
+async def test_automation_tiers_everyday_allows_it(protocol):
+    ran: list[str] = []
+    async with tiered_client(automation_cfg(EVERYDAY), ran, service_token(), protocol) as c:
+        assert (await c.call_tool("play", {})).content[0].text == "playing"
+    assert ran == ["play"]
+
+
+@pytest.mark.anyio
+async def test_automated_caller_never_gets_costly(protocol):
+    ran: list[str] = []
+    async with tiered_client(automation_cfg(EVERYDAY), ran, service_token(), protocol) as c:
+        result = await c.call_tool("update", {})
+    assert result.is_error
+    assert "automated callers may only use: read, power-off, everyday." in result.content[0].text
+    assert ran == []
+
+
+@pytest.mark.anyio
+async def test_set_power_on_refused_off_allowed_for_automated(protocol):
+    ran: list[str] = []
+    async with tiered_client(automation_cfg(), ran, service_token(), protocol) as c:
+        assert (await c.call_tool("set_power", {"state": "off", "tv": "tv-1"})).content[0].text == "off"
+        assert (await c.call_tool("set_power", {"state": "on", "tv": "tv-1"})).is_error
+    assert ran == ["set_power off"]
+
+
+@pytest.mark.anyio
+async def test_a_person_over_http_gets_everyday(protocol):
+    ran: list[str] = []
+    async with tiered_client(automation_cfg(), ran, token(), protocol) as c:
+        assert (await c.call_tool("play", {})).content[0].text == "playing"
+        assert (await c.call_tool("set_power", {"state": "on"})).content[0].text == "on"
+    assert ran == ["play", "set_power on"]
+
+
+@pytest.mark.anyio
+async def test_refusal_logged_at_info(caplog, protocol):
+    caplog.set_level("INFO", logger=remote.__name__)
+    async with tiered_client(automation_cfg(), [], service_token(), protocol) as c:
+        assert (await c.call_tool("set_power", {"state": "on"})).is_error
+    (record,) = [r for r in caplog.records if r.name == remote.__name__ and "refused" in r.getMessage()]
+    assert record.levelname == "INFO"
+    message = record.getMessage()
+    for part in ("automated", "token-1.access", "set_power", "everyday", "refused"):
+        assert part in message
+
+
+@pytest.mark.anyio
+async def test_a_request_that_skipped_the_middleware_is_refused(caplog, protocol):
+    """Nothing defaults open: an HTTP request with no Caller in its scope runs no tool, not even a read."""
+    import uvicorn
+
+    caplog.set_level("INFO", logger=remote.__name__)
+    ran: list[str] = []
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    app = tiered_server(ran).streamable_http_app(streamable_http_path="/thing/mcp", host="127.0.0.1")
+    server = uvicorn.Server(uvicorn.Config(app, log_level="warning", lifespan="on"))
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(server.serve, [sock])
+        while not server.started:
+            await anyio.sleep(0.01)
+        transport = streamable_http_client(f"http://127.0.0.1:{port}/thing/mcp")
+        async with Client(transport, mode=protocol) as c:
+            result = await c.call_tool("status", {})
+        server.should_exit = True
+    assert result.is_error and "can't tell who sent this request" in result.content[0].text
+    assert ran == []
+    assert any("unknown caller unknown, tool status, tier read: refused" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.anyio
+async def test_person_refusal_logged_with_masked_email(caplog, protocol):
+    caplog.set_level("INFO", logger=remote.__name__)
+    async with tiered_client(automation_cfg(), [], token(), protocol) as c:
+        assert (await c.call_tool("update", {})).is_error
+    messages = [r.getMessage() for r in caplog.records if r.name == remote.__name__ and "refused" in r.getMessage()]
+    assert messages and all("u***@example.com" in m and "user@example.com" not in m for m in messages)
+
+
+def http_client(base: str, jwt_token: str, **kwargs: Any) -> Client:
+    transport = streamable_http_client(
+        f"{base}/thing/mcp", http_client=httpx2.AsyncClient(headers={remote.ACCESS_HEADER: jwt_token})
+    )
+    return Client(transport, **kwargs)
+
+
+async def say_yes(context: Any, params: Any) -> ElicitResult:
+    return ElicitResult(action="accept", content={"confirm": True})
+
+
+@pytest.mark.anyio
+async def test_a_person_over_http_confirms_a_costly_call(protocol):
+    ran: list[str] = []
+    async with (
+        running(automation_cfg(), [], server=tiered_server(ran)) as base,
+        http_client(base, token(), mode=protocol, elicitation_callback=say_yes) as c,
+    ):
+        assert (await c.call_tool("update", {})).content[0].text == "updated"
+        # A second, fresh yes to the very same call is its own confirmation, not a replay.
+        assert (await c.call_tool("update", {})).content[0].text == "updated"
+    assert ran == ["update", "update"]
+
+
+@pytest.mark.anyio
+async def test_sealed_confirmation_bound_to_caller(caplog):
+    """Review Focus 3: person A's sealed state, answered and re-sent with person B's JWT, is rejected."""
+    ran: list[str] = []
+    async with running(automation_cfg(), [], server=tiered_server(ran)) as base:
+        a = http_client(base, token(email="user@example.com"), mode="2026-07-28", elicitation_callback=say_yes)
+        b = http_client(base, token(email="other@example.com"), mode="2026-07-28", elicitation_callback=say_yes)
+        async with a, b:
+            first = await a.session.call_tool("update", {}, allow_input_required=True)
+            assert isinstance(first, InputRequiredResult)
+            (key,) = first.input_requests
+            yes = {key: ElicitResult(action="accept", content={"confirm": True})}
+            with pytest.raises(MCPError, match="Invalid or expired requestState"):
+                await b.session.call_tool(
+                    "update", {}, input_responses=yes, request_state=first.request_state, allow_input_required=True
+                )
+            assert ran == []
+            # The same answer from the person it was asked of still runs it.
+            done = await a.session.call_tool(
+                "update", {}, input_responses=yes, request_state=first.request_state, allow_input_required=True
+            )
+            assert done.content[0].text == "updated"
+    assert ran == ["update"]
+    assert any("requestState rejected" in r.getMessage() and "principal" in r.getMessage() for r in caplog.records)
+
+
+def test_request_state_security_ttl_is_120():
+    security = remote.request_state_security()
+    assert security.ttl == 120 == remote.CONFIRM_TIMEOUT
+    assert security.bind_principal is remote.caller_principal
 
 
 @pytest.mark.anyio

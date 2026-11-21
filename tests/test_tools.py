@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import pytest
 from mcp import Client
+from mcp.types import ElicitResult
 
 from shieldtv_mcp import server
 from shieldtv_mcp.client import ShieldClient
@@ -19,11 +20,16 @@ from .conftest import wait_until
 pytestmark = pytest.mark.anyio
 
 
+async def say_yes(context, params) -> ElicitResult:
+    """The person's answer to a costly tool's prompt (shield_reboot asks before it runs)."""
+    return ElicitResult(action="accept", content={"confirm": True})
+
+
 @pytest.fixture
 async def mcp_client(settings, fake, monkeypatch):
     # The server's lifespan builds the ShieldClient; swap in one using the fake.
     monkeypatch.setattr(server, "ShieldClient", lambda s: ShieldClient(s, remote_factory=fake.build))
-    async with Client(server.mcp) as c:
+    async with Client(server.mcp, elicitation_callback=say_yes) as c:
         await wait_until(lambda: server.client().available)
         yield c
 
@@ -264,7 +270,7 @@ async def test_set_power_to_the_current_state_sends_nothing(mcp_client, fake):
 async def dry_client(config_dir, fake, monkeypatch):
     monkeypatch.setenv("SHIELDTV_DRY_RUN", "1")
     monkeypatch.setattr(server, "ShieldClient", lambda s: ShieldClient(s, remote_factory=fake.build))
-    async with Client(server.mcp) as c:
+    async with Client(server.mcp, elicitation_callback=say_yes) as c:
         await wait_until(lambda: server.client().available)
         yield c
 
@@ -330,3 +336,21 @@ async def test_launch_app_fuzzy_suggestions(mcp_client, fake):
     result = await mcp_client.call_tool("shield_launch_app", {"app": "netfli"})
     assert result.is_error
     assert "Closest matches: 'netflix'" in text(result)
+
+
+# --- authorization tiers ----------------------------------------------------------------------
+async def test_reboot_asks_first_and_does_not_run_without_a_yes(settings, fake, monkeypatch):
+    monkeypatch.setattr(server, "ShieldClient", lambda s: ShieldClient(s, remote_factory=fake.build))
+    async with Client(server.mcp) as c:  # no elicitation callback: this app can't show the prompt
+        await wait_until(lambda: server.client().available)
+        result = await c.call_tool("shield_reboot", {})
+    assert result.is_error and "needs your confirmation" in text(result)
+
+
+def test_set_power_is_power_off_only_for_off():
+    from shieldtv_mcp.remote import tier_of
+
+    spec = tier_of(server.shield_set_power)
+    assert spec is not None
+    assert spec.resolve({"state": "off"}) == "power-off"
+    assert spec.resolve({"state": "on"}) == "everyday"
