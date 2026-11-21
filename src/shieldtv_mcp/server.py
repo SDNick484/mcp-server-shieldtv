@@ -36,6 +36,7 @@ from .client import ShieldClient, ShieldError, Status
 from .config import ALLOWED_KEYS, DEFAULT_APPS, KeyName, load_settings
 from .lookup import unknown_with_suggestions
 from .ratelimit import TokenBucket, refusal
+from .remote import request_state_security, tier
 from .tools import ACT, ACT_IDEMPOTENT, DESTRUCTIVE, READ_ONLY
 
 log = logging.getLogger(__name__)
@@ -82,6 +83,7 @@ mcp = MCPServer(
         "The Shield must have been paired once with `mcp-server-shieldtv pair`."
     ),
     lifespan=lifespan,
+    request_state_security=request_state_security(),
 )
 
 # Tool annotations are behavioral hints sent in tools/list. Clients use them to
@@ -121,6 +123,7 @@ def _result(c: ShieldClient, detail: str, sent: list[str], outcome: Outcome = "d
 
 
 @mcp.tool(title="Get Shield status", annotations=READ_ONLY)
+@tier("read")
 def shield_get_status() -> Status:
     """Start here. Query Shield TV power state, reachability, foreground app, and volume.
 
@@ -137,6 +140,7 @@ def shield_get_status() -> Status:
 
 
 @mcp.tool(title="Get what's playing", annotations=READ_ONLY)
+@tier("read")
 async def shield_get_now_playing() -> NowPlaying:
     """Report what is playing: app, title, subtitle (artist or channel), play state, position in seconds.
 
@@ -153,6 +157,7 @@ async def shield_get_now_playing() -> NowPlaying:
 
 
 @mcp.tool(title="Check Bluetooth remotes", annotations=READ_ONLY)
+@tier("read")
 async def shield_get_remotes() -> RemotesReport:
     """List the Shield's Bluetooth remotes (e.g. a Harmony hub) and whether each works.
 
@@ -169,6 +174,7 @@ async def shield_get_remotes() -> RemotesReport:
 
 
 @mcp.tool(title="Reboot the Shield", annotations=DESTRUCTIVE)
+@tier("costly", confirm="Reboot the Shield TV? Playback stops and it is unreachable for about 40 seconds.")
 async def shield_reboot() -> RebootResult:
     """Restart the Shield TV.
 
@@ -192,6 +198,7 @@ async def shield_reboot() -> RebootResult:
 
 
 @mcp.tool(title="List launchable apps", annotations=READ_ONLY)
+@tier("read")
 def shield_list_apps() -> dict[str, str]:
     """List the app names launch_app accepts (friendly name -> the link it opens).
 
@@ -213,6 +220,7 @@ Repeat = Annotated[int, Field(ge=1, le=10, description="How many times to press 
 
 
 @mcp.tool(title="Press a remote key", annotations=ACT)
+@tier("everyday")
 def shield_send_key(key: KeyName, repeat: Repeat = 1) -> ActionResult:
     """Press a remote-control key on the Shield, e.g. DPAD_DOWN with repeat=3 to move down three rows.
 
@@ -247,6 +255,7 @@ def shield_send_key(key: KeyName, repeat: Repeat = 1) -> ActionResult:
 
 
 @mcp.tool(title="Launch an app", annotations=ACT_IDEMPOTENT)
+@tier("everyday")
 async def shield_launch_app(
     app: Annotated[str, Field(description="Friendly app name from shield_list_apps, e.g. 'netflix'.")],
 ) -> ActionResult:
@@ -282,6 +291,7 @@ async def shield_launch_app(
 
 
 @mcp.tool(title="Wake or sleep the Shield", annotations=ACT_IDEMPOTENT)
+@tier(lambda args: "power-off" if args["state"] == "off" else "everyday")
 async def shield_set_power(state: Literal["on", "off"]) -> ActionResult:
     """Wake the Shield ('on') or put it to sleep ('off').
 

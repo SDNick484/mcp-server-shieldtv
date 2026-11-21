@@ -172,12 +172,18 @@ CF_ACCESS_TEAM_DOMAIN=<team>.cloudflareaccess.com CF_ACCESS_AUD=<aud tag> \
 | `--public-host` | `MCP_PUBLIC_HOSTS` | none: only loopback Host headers pass |
 | | `CF_ACCESS_TEAM_DOMAIN`, `CF_ACCESS_AUD` | none: no Access checks |
 | | `MCP_ALLOWED_EMAILS` | anyone Access lets in |
+| | `MCP_ALLOWED_SERVICE_TOKENS` | none: a service token gets 403 (comma-separated client IDs, e.g. `token-1.access`) |
+| | `MCP_AUTOMATION_TIERS` | `read,power-off`: what an admitted service token may use (may add `everyday`; never `costly`) |
 
 With Access configured, every request needs a valid `Cf-Access-Jwt-Assertion`: the signature
 (the team's published keys), audience, issuer, expiry, and the email allow-list if set.
 Anything else gets a plain 403. The server **refuses to start** on a non-loopback address
 without Access unless you pass `--insecure-no-auth` (for trusted-LAN testing only). It also
 checks `Host` and `Origin` (DNS-rebinding protection), including on `--bind 0.0.0.0`.
+A service token (no email in its JWT) is also refused unless its client ID is in
+`MCP_ALLOWED_SERVICE_TOKENS`, and then it may only use the tiers in `MCP_AUTOMATION_TIERS`;
+people's logins may use every tier. This is a change: a service token used to get in on
+passing Access. See [Costly tools](#costly-tools).
 `GET /healthz` answers without auth. `src/shieldtv_mcp/remote.py` is identical in all four
 servers.
 
@@ -272,6 +278,15 @@ step louder; the receiver's and TV's own servers cap a level they are set to (`m
 presses. Over the limit, `send_key` refuses the whole call and points to those servers' volume tools.
 Volume down and mute are never limited. `"volume_up_limit"` in `config.json` or
 `SHIELDTV_VOLUME_UP_LIMIT` lowers the cap (1-20).
+
+### Costly tools
+
+Every tool has an authorization tier: `read` (`get_status`, `list_apps`, `get_now_playing`,
+`get_remotes`), `power-off` (`set_power` with `off`), `everyday` (`send_key`, `launch_app`,
+`set_power` with `on`) or `costly`. The one costly tool is **`reboot_shield`**: it stops playback
+and the Shield is unreachable for about 40 seconds, so it asks you to confirm in a prompt the
+model can't answer, and runs once per yes. Where the app can't show the prompt (today, everything
+but the Claude Code CLI) it refuses and says so; an automated caller never gets it.
 
 ### Resources and prompts
 
@@ -370,8 +385,8 @@ app, the app usually still opens, but its own scheme (if it has one) avoids the 
   constant commands (`dumpsys media_session`, `dumpsys bluetooth_manager`, `dumpsys input`,
   `getprop sys.boot_completed`, `/proc/uptime`), plus ADB's own reboot service. Code that
   tries any other command is refused, so nothing the model writes reaches the Shield's shell.
-- **`reboot_shield` is the only tool marked destructive**: it interrupts playback, so
-  clients should confirm with you first.
+- **`reboot_shield` is the only tool marked destructive**: it interrupts playback, so it is `costly` and
+  asks you to confirm first (see [Costly tools](#costly-tools)).
 - **Credentials are private** (`0600`) and never logged. Logs go to stderr because stdout
   belongs to the MCP transport.
 - Tools carry titles and MCP annotations (`readOnlyHint`, `destructiveHint`,
