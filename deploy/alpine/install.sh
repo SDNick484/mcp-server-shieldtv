@@ -7,6 +7,7 @@
 # credentials to itself, and change nothing else):
 #   /opt/mcp-server-shieldtv/venv     the code                     root:root            0755
 #   /opt/mcp-server-shieldtv/run.sh   the service command          root:root            0755
+#   /opt/mcp-server-shieldtv/COMMIT   the installed commit, if any root:root            0644
 #   /etc/mcp-server-shieldtv/env      HTTP and Access settings     root:mcp-shieldtv    0640
 #   /var/lib/mcp-server-shieldtv/     cert.pem, key.pem, adbkey,   mcp-shieldtv         0700 / files 0600
 #                                     config.json (SHIELDTV_CONFIG_DIR)
@@ -16,6 +17,8 @@
 # own: `pair` (run as the service user) writes them, and the server rewrites
 # config.json when the Shield moves to a new address.
 # Re-running upgrades the code and keeps settings and pairing.
+# COMMIT (the SHA installed, and this repo) is what /healthz and /shieldtv/mcp/healthz report; the
+# default SOURCE is pinned to main's current commit first, so the stamp names what pip installed.
 set -eu
 
 SRC="${1:-git+https://github.com/SDNick484/mcp-server-shieldtv}"
@@ -29,12 +32,19 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 
 # python3 and its venv module; every compiled dependency ships a musl wheel,
 # so no compiler is needed (see README: Alpine).
-apk add --no-cache python3 py3-pip openrc >/dev/null
+apk add --no-cache python3 py3-pip openrc git >/dev/null
 
 if ! id "$USER_NAME" >/dev/null 2>&1; then
 	addgroup -S "$USER_NAME"
 	adduser -S -D -H -h "$STATE" -s /sbin/nologin -G "$USER_NAME" "$USER_NAME"
 fi
+
+# Which commit SOURCE is, worked out before pip (commit.sh, shared with the sibling servers)
+. "$HERE/commit.sh"
+REPO=SDNick484/mcp-server-shieldtv
+pinned=$(commit_source "$SRC" "$REPO")
+SRC=$(printf '%s\n' "$pinned" | sed -n 1p)
+COMMIT=$(printf '%s\n' "$pinned" | sed -n 2p)
 
 python3 -m venv "$PREFIX/venv"
 "$PREFIX/venv/bin/pip" install --quiet --upgrade pip
@@ -43,6 +53,8 @@ python3 -m venv "$PREFIX/venv"
 # and keeps it: re-running this script would upgrade nothing. Reinstall the package itself (not its
 # dependencies) so it always gets the code from SOURCE.
 "$PREFIX/venv/bin/pip" install --quiet --force-reinstall --no-deps "$SRC"
+# Only now that pip succeeded (set -e stops before this otherwise), so COMMIT never names code that isn't installed
+write_commit "$PREFIX" "$COMMIT" "$REPO"
 install -m 0755 "$HERE/run.sh" "$PREFIX/run.sh"
 
 install -d -m 0750 -o root -g "$USER_NAME" "$ETC"

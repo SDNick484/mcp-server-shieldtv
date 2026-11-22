@@ -251,7 +251,7 @@ curl -s http://127.0.0.1:8712/healthz
 
 Expected: `install.sh` finishes without compiling anything, the pairing code shows on the TV,
 `doctor` passes as in step 2 (mDNS too, unless the LXC's bridge filters multicast), `healthz`
-answers `{"status": "ok"}`, `ps -o user,args | grep shieldtv` shows `mcp-shieldtv`, and
+answers `{"status": "ok", "commit": ...}`, `ps -o user,args | grep shieldtv` shows `mcp-shieldtv`, and
 `/var/lib/mcp-server-shieldtv/*.pem` are `-rw------- mcp-shieldtv`.
 
 With cloudflared and an Access application (README: HTTP and Cloudflare Access), set

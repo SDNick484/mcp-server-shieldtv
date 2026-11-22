@@ -64,6 +64,14 @@ show the prompt (today everything but the Claude Code CLI) it is refused. The si
 calling a tiered tool directly from Python is refused: a test that means to skip the check calls
 ``fn.__wrapped__``. The README's "What each caller may do" has the tiers, the settings and the wiring.
 
+Health: ``GET /healthz`` and ``GET <MCP_HTTP_PATH>/healthz`` (e.g. ``/harmony/mcp/healthz``, the
+one a tunnel that routes only the MCP path still reaches) answer before the Access check: 200
+``{"status": "ok", ...}``, or 503 ``"degraded"`` when the server's ``health_check`` says so. Both
+add ``commit`` (the SHA of the code installed) and ``repo`` (``owner/name``) from a COMMIT file,
+line 1 and 2, that install.sh writes beside the venv (``$PREFIX/COMMIT``, or MCP_COMMIT_FILE).
+It is read on every request; a field that is missing or doesn't check out is left out, and never
+changes the status.
+
 Stopping: OpenRC's supervise-daemon (every sibling's init script) stops a
 service with SIGTERM and SIGKILLs it 5 seconds later by default
 (``--retry SIGTERM/5``). A SIGKILL skips the lifespan shutdown, where the
@@ -89,10 +97,13 @@ import json
 import logging
 import os
 import re
+import stat
+import sys
 import time
 import typing
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Annotated, Any, Literal, TypeVar, cast
 
 import anyio
@@ -113,6 +124,12 @@ log = logging.getLogger(__name__)
 
 ACCESS_HEADER = "cf-access-jwt-assertion"
 HEALTH_PATH = "/healthz"
+# The commit the installed code comes from, for the health body. install.sh writes $PREFIX/COMMIT
+# (line 1 the SHA, line 2 optionally owner/repo) beside $PREFIX/venv; this overrides where it is.
+COMMIT_FILE_ENV = "MCP_COMMIT_FILE"
+COMMIT_FILE_MAX = 512  # bytes: a SHA and a repo name are well under; anything bigger is the wrong file
+_COMMIT_RE = re.compile(r"^[0-9a-f]{7,40}$")
+_REPO_RE = re.compile(r"^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$")
 # Headers a proxy adds to what it forwards. A request with one didn't start on this machine.
 FORWARDED_HEADERS = (
     "forwarded",
@@ -835,11 +852,48 @@ async def _plain(send: Send, status: int, body: Mapping[str, Any]) -> None:
     await send({"type": "http.response.body", "body": data})
 
 
+def running_commit(env: Mapping[str, str] | None = None) -> dict[str, str]:
+    """The ``commit`` and ``repo`` the COMMIT file names, each only if it reads and checks out.
+
+    Read on every call, so restamping the file shows without a restart. Never raises: a missing,
+    unreadable, oversized or malformed file just leaves the field out.
+    """
+    env = os.environ if env is None else env
+    path = env.get(COMMIT_FILE_ENV) or Path(sys.prefix).parent / "COMMIT"
+    try:
+        # Non-blocking, and regular files only: this runs on the event loop, where a FIFO or tty at
+        # the path (a mistaken MCP_COMMIT_FILE) would otherwise stall every request, not just this one.
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+        with open(fd, "rb") as f:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return {}
+            raw = f.read(COMMIT_FILE_MAX + 1)
+        lines = raw.decode("ascii").splitlines() if len(raw) <= COMMIT_FILE_MAX else []
+    except (OSError, UnicodeDecodeError):
+        return {}
+    found: dict[str, str] = {}
+    if lines and _COMMIT_RE.fullmatch(lines[0]):
+        found["commit"] = lines[0]
+    if len(lines) > 1 and _REPO_RE.fullmatch(lines[1]):
+        found["repo"] = lines[1]
+    return found
+
+
+def health_paths(mcp_path: str | None) -> frozenset[str]:
+    """``/healthz``, and ``<mcp_path>/healthz``: the tunnel routes only the MCP path to a server, so
+    that one is the health check reachable from outside."""
+    paths = {HEALTH_PATH}
+    if mcp_path:
+        paths.add(mcp_path.rstrip("/") + HEALTH_PATH)
+    return frozenset(paths)
+
+
 class AccessMiddleware:
     """Lets a request through only with a valid Access assertion.
 
     Lifespan events pass untouched (the MCP session manager starts there), and
-    the health check is answered before auth so a local monitor can use it.
+    the health check (``/healthz`` and ``<path>/healthz``) is answered before auth so a monitor can
+    use it.
     With no verifier and ``local_only``, a request a proxy forwarded is refused
     instead (see the module docstring).
 
@@ -856,11 +910,13 @@ class AccessMiddleware:
         local_only: bool = False,
         health_check: HealthChecker | None = None,
         automation_tiers: frozenset[str] = DEFAULT_AUTOMATION_TIERS,
+        mcp_path: str | None = None,
     ) -> None:
         self.app = app
         self.verifier = verifier
         self.local_only = local_only
         self.health_check = health_check
+        self.health_paths = health_paths(mcp_path)
         self.automation_tiers = automation_tiers
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -882,26 +938,11 @@ class AccessMiddleware:
                 )
                 await _plain(send, 403, {"error": "forbidden"})
                 return
-        if scope["path"] == HEALTH_PATH and scope.get("method") in ("GET", "HEAD"):
-            if self.health_check is None:
-                await _plain(send, 200, {"status": "ok"})
-                return
-            try:
-                res = await self.health_check()
-            except Exception as exc:
-                log.warning("Health check failed: %s", exc)
-                await _plain(send, 503, {"status": "degraded", "error": "health check failed"})
-                return
-            if res is False:
-                await _plain(send, 503, {"status": "degraded", "error": "health check returned False"})
-                return
-            if res is True:
-                await _plain(send, 200, {"status": "ok"})
-                return
-            if res.get("status") == "degraded" or "error" in res:
-                await _plain(send, 503, {**res, "status": "degraded"})
-            else:
-                await _plain(send, 200, {**res, "status": "ok"})
+        if scope["path"] in self.health_paths and scope.get("method") in ("GET", "HEAD"):
+            status, body = await self._health()
+            # commit and repo come only from the COMMIT file, never from the server's own check
+            body = {k: v for k, v in body.items() if k not in ("commit", "repo")}
+            await _plain(send, status, {**body, **running_commit()})
             return
         if scope.get("method") == "OPTIONS":
             origin = headers.get(b"origin", b"*")
@@ -936,6 +977,22 @@ class AccessMiddleware:
             log.debug("Access OK for %s caller %s", caller.kind, caller.shown)
         scope.setdefault("state", {})[CALLER_STATE_KEY] = caller
         await self.app(scope, receive, send)
+
+    async def _health(self) -> tuple[int, dict[str, Any]]:
+        if self.health_check is None:
+            return 200, {"status": "ok"}
+        try:
+            res = await self.health_check()
+        except Exception as exc:
+            log.warning("Health check failed: %s", exc)
+            return 503, {"status": "degraded", "error": "health check failed"}
+        if res is False:
+            return 503, {"status": "degraded", "error": "health check returned False"}
+        if res is True:
+            return 200, {"status": "ok"}
+        if res.get("status") == "degraded" or "error" in res:
+            return 503, {**res, "status": "degraded"}
+        return 200, {**res, "status": "ok"}
 
 
 def transport_security(cfg: HttpConfig) -> TransportSecuritySettings:
@@ -995,6 +1052,7 @@ def build_app(
         local_only=cfg.local_only,
         health_check=health_check,
         automation_tiers=cfg.automation_tiers,
+        mcp_path=cfg.path,
     )
 
 

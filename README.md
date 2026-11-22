@@ -184,7 +184,9 @@ A service token (no email in its JWT) is also refused unless its client ID is in
 `MCP_ALLOWED_SERVICE_TOKENS`, and then it may only use the tiers in `MCP_AUTOMATION_TIERS`;
 people's logins may use every tier. This is a change: a service token used to get in on
 passing Access. See [Costly tools](#costly-tools).
-`GET /healthz` answers without auth. `src/shieldtv_mcp/remote.py` is identical in all four
+`GET /healthz` and `GET /shieldtv/mcp/healthz` (the one a tunnel that routes only `/shieldtv/mcp`
+reaches) answer without auth, with the commit the install script stamped (`"commit"`, `"repo"`;
+from `/opt/mcp-server-shieldtv/COMMIT`). `src/shieldtv_mcp/remote.py` is identical in all four
 servers.
 
 ### As a service on Alpine (Proxmox LXC)
@@ -200,6 +202,7 @@ rc-update add mcp-server-shieldtv default && rc-service mcp-server-shieldtv star
 | Path | Owner, mode | Holds |
 |---|---|---|
 | `/opt/mcp-server-shieldtv/venv` | root, 0755 | The code |
+| `/opt/mcp-server-shieldtv/COMMIT` | root, 0644 | The installed commit and repo, if known (reported by `/healthz`) |
 | `/etc/mcp-server-shieldtv/env` | root:mcp-shieldtv, 0640 | HTTP and Access settings |
 | `/var/lib/mcp-server-shieldtv/` | mcp-shieldtv, 0700 (files 0600) | `cert.pem`, `key.pem`, `adbkey`, `config.json` |
 | `/var/log/mcp-server-shieldtv/server.log` | mcp-shieldtv, 0750 | Logs, redacted |

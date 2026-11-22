@@ -4,6 +4,7 @@
 
 ### Added
 
+- `GET /shieldtv/mcp/healthz`, the health check under the MCP path (the only one a tunnel routing `/shieldtv/mcp` reaches), and both health routes report the installed `commit` and `repo` from `/opt/mcp-server-shieldtv/COMMIT`, which `deploy/alpine/install.sh` now writes (pinning the default source to `main`'s current commit first). `remote.py` and the new `deploy/alpine/commit.sh` synced from mcp-server-shared a48209b; the install needs `git`.
 - Every tool now has an authorization tier (`read`, `power-off`, `everyday` or `costly`), from the shared `@tier` in `remote.py` (synced to mcp-server-shared f4719e3). `shield_set_power` is `power-off` for `off` and `everyday` for `on`. `shield_reboot` is `costly`: it asks the person to confirm in a prompt the model can't answer, and refuses where the app can't show the prompt (today, everything but the Claude Code CLI). It runs once per yes.
 - `MCP_ALLOWED_SERVICE_TOKENS` (comma-separated Access service-token client IDs) and `MCP_AUTOMATION_TIERS` (what those callers may use; default `read,power-off`, never `costly`).
 
