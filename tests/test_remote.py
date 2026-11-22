@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import os
 import socket
+import threading
 import time
 from contextlib import asynccontextmanager
 from typing import Any
@@ -46,6 +48,24 @@ async def public_key(_token: str) -> object:
 
 
 POLICY = remote.AccessPolicy(TEAM, (AUD,))
+SHA = "0123456789abcdef0123456789abcdef01234567"
+SHA_B = "fedcba9876543210fedcba9876543210fedcba98"
+REPO = "SDNick484/mcp-server-demo"
+
+
+@pytest.fixture(autouse=True)
+def no_commit_file(monkeypatch, tmp_path):
+    """No COMMIT file unless a test writes one: one beside this machine's venv mustn't leak into bodies."""
+    monkeypatch.setenv(remote.COMMIT_FILE_ENV, str(tmp_path / "absent"))
+
+
+def commit_file(monkeypatch, tmp_path, content: str | bytes) -> None:
+    path = tmp_path / "COMMIT"
+    if isinstance(content, str):
+        path.write_text(content)
+    else:
+        path.write_bytes(content)
+    monkeypatch.setenv(remote.COMMIT_FILE_ENV, str(path))
 
 
 # --- configuration -------------------------------------------------------------
@@ -761,6 +781,173 @@ async def test_health_check_exception_returns_503():
     async with running(CFG, [], health_check=broken) as base, httpx2.AsyncClient() as http:
         resp = await http.get(f"{base}/healthz")
         assert (resp.status_code, resp.json()) == (503, {"status": "degraded", "error": "health check failed"})
+
+
+@pytest.mark.anyio
+async def test_health_reports_commit_and_repo(monkeypatch, tmp_path):
+    commit_file(monkeypatch, tmp_path, f"{SHA}\n{REPO}\n")
+    async with running(CFG, []) as base, httpx2.AsyncClient() as http:
+        resp = await http.get(f"{base}/healthz")
+        assert (resp.status_code, resp.json()) == (200, {"status": "ok", "commit": SHA, "repo": REPO})
+
+
+async def _false() -> bool:
+    return False
+
+
+async def _raises() -> bool:
+    raise RuntimeError("device off")
+
+
+async def _error() -> dict[str, Any]:
+    return {"error": "x"}
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("check", [_false, _raises, _error])
+async def test_degraded_health_reports_commit(monkeypatch, tmp_path, check):
+    commit_file(monkeypatch, tmp_path, f"{SHA}\n{REPO}\n")
+    async with running(CFG, [], health_check=check) as base, httpx2.AsyncClient() as http:
+        resp = await http.get(f"{base}/healthz")
+        body = resp.json()
+        assert resp.status_code == 503 and body["status"] == "degraded"
+        assert (body["commit"], body["repo"]) == (SHA, REPO)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "content,expected",
+    [
+        (None, {}),  # missing
+        ("", {}),
+        ("not-a-sha\n", {}),
+        ("ABCDEF0\n", {}),  # uppercase
+        (f"{SHA}0\n", {}),  # 41 characters
+        (f"{SHA}\n", {"commit": SHA}),  # one line only
+        (f"{SHA}", {"commit": SHA}),  # no newline
+        (f"{SHA}\nbad repo!\n", {"commit": SHA}),
+        (f"zz\n{REPO}\n", {"repo": REPO}),
+        ("dir", {}),  # a directory where the file should be
+        (b"\xff\xfe" + SHA.encode(), {}),  # not text
+        ("a" * 1_000_000, {}),  # far too big: someone pointed MCP_COMMIT_FILE at the wrong file
+    ],
+)
+async def test_bad_commit_file_leaves_fields_out(monkeypatch, tmp_path, content, expected):
+    if content == "dir":
+        (tmp_path / "COMMIT").mkdir()
+        monkeypatch.setenv(remote.COMMIT_FILE_ENV, str(tmp_path / "COMMIT"))
+    elif content is not None:
+        commit_file(monkeypatch, tmp_path, content)
+    async with running(CFG, []) as base, httpx2.AsyncClient() as http:
+        resp = await http.get(f"{base}/healthz")
+        assert (resp.status_code, resp.json()) == (200, {"status": "ok", **expected})
+
+
+@pytest.mark.anyio
+async def test_commit_file_is_read_on_every_request(monkeypatch, tmp_path):
+    commit_file(monkeypatch, tmp_path, f"{SHA}\n{REPO}\n")
+    async with running(CFG, []) as base, httpx2.AsyncClient() as http:
+        first = (await http.get(f"{base}/healthz")).json()
+        commit_file(monkeypatch, tmp_path, f"{SHA_B}\n{REPO}\n")
+        second = (await http.get(f"{base}/healthz")).json()
+    assert (first["commit"], second["commit"]) == (SHA, SHA_B)
+
+
+@pytest.mark.anyio
+async def test_commit_file_wins_over_health_check_keys(monkeypatch, tmp_path):
+    async def check():
+        return {"commit": "from-the-check", "hub": "connected"}
+
+    commit_file(monkeypatch, tmp_path, f"{SHA}\n")
+    async with running(CFG, [], health_check=check) as base, httpx2.AsyncClient() as http:
+        resp = await http.get(f"{base}/healthz")
+        assert resp.json() == {"status": "ok", "hub": "connected", "commit": SHA}
+
+
+@pytest.mark.anyio
+async def test_health_under_the_mcp_path_needs_no_assertion():
+    async with running(CFG, []) as base, httpx2.AsyncClient() as http:
+        for path in ("/thing/mcp/healthz", "/healthz"):
+            resp = await http.get(f"{base}{path}")
+            assert (resp.status_code, resp.json()) == (200, {"status": "ok"}), path
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("check,status", [(None, 200), (_false, 503)])
+async def test_health_under_the_mcp_path_reports_commit(monkeypatch, tmp_path, check, status):
+    commit_file(monkeypatch, tmp_path, f"{SHA}\n{REPO}\n")
+    async with running(CFG, [], health_check=check) as base, httpx2.AsyncClient() as http:
+        for path in ("/thing/mcp/healthz", "/healthz"):
+            resp = await http.get(f"{base}{path}")
+            body = resp.json()
+            assert (resp.status_code, body["commit"], body["repo"]) == (status, SHA, REPO), path
+
+
+@pytest.mark.anyio
+async def test_health_under_a_multi_segment_path():
+    cfg = remote.HttpConfig(path="/mcp/backlog", public_hosts=("mcp.example.com",), access=POLICY)
+    async with running(cfg, []) as base, httpx2.AsyncClient() as http:
+        resp = await http.get(f"{base}/mcp/backlog/healthz")
+        assert (resp.status_code, resp.json()) == (200, {"status": "ok"})
+
+
+def test_health_paths_strip_a_trailing_slash():
+    assert remote.health_paths("/mcp/backlog/") == frozenset({"/healthz", "/mcp/backlog/healthz"})
+    assert remote.health_paths(None) == frozenset({"/healthz"})
+
+
+@pytest.mark.anyio
+async def test_post_to_the_mcp_health_path_needs_an_assertion():
+    async with running(CFG, []) as base, httpx2.AsyncClient() as http:
+        resp = await http.post(f"{base}/thing/mcp/healthz")
+        assert resp.status_code == 403 and resp.json() == {"error": "forbidden"}
+
+
+@pytest.mark.anyio
+async def test_mcp_health_path_refuses_forwarded_when_local_only():
+    async with running(LOCAL, []) as base, httpx2.AsyncClient() as http:
+        resp = await http.get(f"{base}/thing/mcp/healthz", headers={"x-forwarded-for": "203.0.113.7"})
+        assert resp.status_code == 403 and resp.json() == {"error": "forbidden"}
+
+
+@pytest.mark.anyio
+async def test_health_check_keys_never_stand_in_for_the_commit_file():
+    async def check():
+        return {"commit": "firmware-hash", "repo": "someone/else", "hub": "connected"}
+
+    async with running(CFG, [], health_check=check) as base, httpx2.AsyncClient() as http:
+        resp = await http.get(f"{base}/healthz")
+        assert resp.json() == {"status": "ok", "hub": "connected"}
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs a FIFO")
+def test_a_fifo_at_the_commit_path_does_not_block(tmp_path):
+    fifo = tmp_path / "COMMIT"
+    os.mkfifo(fifo)
+    result: list[dict[str, str]] = []
+    t = threading.Thread(target=lambda: result.append(remote.running_commit(env={remote.COMMIT_FILE_ENV: str(fifo)})))
+    t.daemon = True
+    t.start()
+    t.join(2)
+    blocked = t.is_alive()
+    if blocked:  # opened for reading, waiting for a writer: give it one so the thread ends
+        with open(fifo, "wb"):
+            pass
+        t.join(2)
+    assert not blocked and result == [{}]
+
+
+def test_running_commit_defaults_beside_the_venv(monkeypatch, tmp_path):
+    monkeypatch.setattr(remote.sys, "prefix", str(tmp_path / "venv"))
+    (tmp_path / "COMMIT").write_text(f"{SHA}\n{REPO}\n")
+    assert remote.running_commit(env={}) == {"commit": SHA, "repo": REPO}
+
+
+def test_running_commit_env_overrides_the_default(monkeypatch, tmp_path):
+    monkeypatch.setattr(remote.sys, "prefix", str(tmp_path / "venv"))
+    (tmp_path / "COMMIT").write_text(f"{SHA}\n")
+    (tmp_path / "other").write_text(f"{SHA_B}\n")
+    assert remote.running_commit(env={remote.COMMIT_FILE_ENV: str(tmp_path / "other")}) == {"commit": SHA_B}
 
 
 @pytest.mark.anyio
