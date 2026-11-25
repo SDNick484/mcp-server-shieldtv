@@ -37,7 +37,7 @@ from .config import ALLOWED_KEYS, DEFAULT_APPS, KeyName, load_settings
 from .lookup import unknown_with_suggestions
 from .ratelimit import TokenBucket, refusal
 from .remote import request_state_security, tier
-from .tools import ACT, ACT_IDEMPOTENT, DESTRUCTIVE, READ_ONLY
+from .tools import ACT, ACT_IDEMPOTENT, DESTRUCTIVE, READ_ONLY, trim_tools
 
 log = logging.getLogger(__name__)
 
@@ -314,6 +314,10 @@ async def shield_set_power(state: Literal["on", "off"]) -> ActionResult:
         return _result(c, "wake the Shield" if on else "put the Shield to sleep", sent, "dry_run")
     await c.set_power(on)
     return _result(c, f"The Shield is {word}", sent)
+
+
+# Every tool is registered by now: shorten what tools/list sends (see tools.py).
+trim_tools(mcp)
 
 
 # ---------------------------------------------------------------------------

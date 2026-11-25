@@ -4,5 +4,5 @@
 # present, is the tag on that commit: a label only, the commit is the pin. An
 # optional `exclude = ["remote"]` names shared modules this repo doesn't take.
 repo = "SDNick484/mcp-server-shared"
-commit = "a48209bc6a615a22f16418cf4d8a3575b238d313"
+commit = "6f34e075ad32035b0ded9796591c9308feffd54b"
 package = "shieldtv_mcp"
